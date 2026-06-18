@@ -179,6 +179,25 @@ def test_nagiperfect_chroma_branch_identity_init():
     assert torch.allclose(aux["output"], x, atol=1e-4), (aux["output"] - x).abs().max()
 
 
+def test_nagiperfect_chroma_smooth_branch_identity_init():
+    m = NagiPerfect(
+        width=8,
+        enc_blk_nums=(1, 1),
+        middle_blk_num=1,
+        dec_blk_nums=(1, 1),
+        chroma_smooth_branch=True,
+        chroma_smooth_strength=0.5,
+        chroma_smooth_gate_bias=-12.0,
+    ).eval()
+    x = torch.rand(1, 3, 35, 41) * 2.0
+    with torch.no_grad():
+        aux = m(x, return_aux=True)
+    assert aux["output"].shape == x.shape
+    assert aux["chroma_residual"].shape == x.shape
+    assert aux["chroma_smooth_gate"].shape == (1, 1, 35, 41)
+    assert torch.allclose(aux["output"], x, atol=1e-4), (aux["output"] - x).abs().max()
+
+
 def test_nagiperfect_input_highlight_guard_locks_highlights():
     m = NagiPerfect(
         width=8,

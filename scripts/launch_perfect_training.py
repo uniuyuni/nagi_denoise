@@ -22,6 +22,7 @@ VARIANTS = {
     "perfect_s_flatpush_2k": "packages/nagi_nr/configs/nagiperfect_s_flatpush_2k.yaml",
     "perfect_s_flatguard_500": "packages/nagi_nr/configs/nagiperfect_s_flatguard_500.yaml",
     "perfect_s_hlguard_1k": "packages/nagi_nr/configs/nagiperfect_s_hlguard_1k.yaml",
+    "perfect_s_smoothgate_3k": "packages/nagi_nr/configs/nagiperfect_s_smoothgate_3k.yaml",
     "perfect_s_basepush_2k": "packages/nagi_nr/configs/nagiperfect_s_basepush_2k.yaml",
     "perfect_s_pilot_500": "packages/nagi_nr/configs/nagiperfect_s_pilot_500.yaml",
     "perfect_s_stable_2k": "packages/nagi_nr/configs/nagiperfect_s_stable_2k.yaml",

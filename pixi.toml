@@ -111,6 +111,7 @@ train-nagiperfect-s-chromalocal-3k = "python scripts/launch_perfect_training.py 
 train-nagiperfect-s-denoisepush-5k = "python scripts/launch_perfect_training.py perfect_s_denoisepush_5k"
 train-nagiperfect-s-flatpush-2k = "python scripts/launch_perfect_training.py perfect_s_flatpush_2k"
 train-nagiperfect-s-flatguard-500 = "python scripts/launch_perfect_training.py perfect_s_flatguard_500"
+train-nagiperfect-s-smoothgate-3k = "python scripts/launch_perfect_training.py perfect_s_smoothgate_3k"
 train-nagiperfect-s-strictflat-5k = "python scripts/launch_perfect_training.py perfect_s_strictflat_5k"
 train-nagiperfect-s-strictflat-2k = "python scripts/launch_perfect_training.py perfect_s_strictflat_2k"
 train-nagiperfect-s-hlguard-1k = "python scripts/launch_perfect_training.py perfect_s_hlguard_1k"
