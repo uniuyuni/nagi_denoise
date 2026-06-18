@@ -1,0 +1,367 @@
+"""SIDD Medium sRGB dataset loader for Nagi NR.
+
+Expected layout (as downloaded from the SIDD project page):
+
+    <root>/
+        Data/
+            0001_001_S6_00100_00060_3200_L/
+                0001_NOISY_SRGB_010.PNG
+                0001_GT_SRGB_010.PNG
+                ...
+            0002_.../
+            ...
+
+Either the parent directory or `<root>/Data` itself can be passed as `root`.
+
+I/O strategy: SIDD images are ~5328x3000 PNG (~25MB each). Decoding one PNG
+costs ~0.5-1s, so naive random patch sampling makes training I/O-bound.
+
+This module ships:
+  * `SIDDPatchDataset` — caches the last-decoded pair per instance.
+  * `ChunkedShuffleSampler` — yields indices grouped by image so the cache hits.
+
+Use them together via `make_sidd_loader` (or directly in your own DataLoader).
+"""
+from __future__ import annotations
+from io import BytesIO
+from pathlib import Path
+from typing import Iterable, Iterator, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, Sampler
+from PIL import Image
+
+from .transforms import srgb_to_linear
+
+
+# ---- Synthetic degradations (sRGB uint8 space) ----
+def _jpeg_recompress(img_u8: np.ndarray, q: int) -> np.ndarray:
+    """Encode then decode as JPEG to inject compression artifacts."""
+    buf = BytesIO()
+    Image.fromarray(img_u8).save(buf, format="JPEG", quality=int(q))
+    buf.seek(0)
+    with Image.open(buf) as im:
+        return np.array(im.convert("RGB"), dtype=np.uint8)
+
+
+def _apply_synth_degradation(
+    rng: np.random.Generator,
+    clean_u8: np.ndarray,
+    gauss_sigma_max: float = 30.0,
+    poisson_lambda_range: Tuple[float, float] = (10.0, 100.0),
+    jpeg_q_range: Tuple[int, int] = (60, 100),
+) -> np.ndarray:
+    """Pick one of {gauss, poisson, gauss+jpeg, jpeg} and apply it.
+
+    All operations are in sRGB uint8 space (matches how real noise enters
+    the image pipeline). Caller converts the result to linear afterwards.
+    """
+    mode = rng.choice(["gauss", "poisson", "gauss_jpeg", "jpeg"])
+    img = clean_u8.astype(np.float32)
+
+    if mode == "gauss":
+        sigma = float(rng.uniform(0.0, gauss_sigma_max))
+        img = img + rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+
+    elif mode == "poisson":
+        lam = float(rng.uniform(*poisson_lambda_range))
+        # Map [0,255] -> [0,lam], sample Poisson, map back.
+        scale = lam / 255.0
+        signal = np.clip(img * scale, 0.0, None)
+        img = rng.poisson(signal).astype(np.float32) / max(scale, 1e-8)
+
+    elif mode == "gauss_jpeg":
+        sigma = float(rng.uniform(5.0, gauss_sigma_max))
+        img = img + rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+        img_u8 = np.clip(img, 0.0, 255.0).astype(np.uint8)
+        q = int(rng.integers(jpeg_q_range[0], jpeg_q_range[1] + 1))
+        return _jpeg_recompress(img_u8, q=q)
+
+    else:  # "jpeg"
+        q = int(rng.integers(jpeg_q_range[0], jpeg_q_range[1] + 1))
+        return _jpeg_recompress(clean_u8, q=q)
+
+    return np.clip(img, 0.0, 255.0).astype(np.uint8)
+
+
+def find_sidd_pairs(root: str | Path) -> List[Tuple[str, str]]:
+    """Discover (noisy_path, gt_path) pairs under a SIDD root."""
+    root = Path(root)
+    candidates = [root / "Data", root]
+    data_dir = next((p for p in candidates if p.is_dir()), None)
+    if data_dir is None:
+        raise FileNotFoundError(f"SIDD root not found: {root}")
+
+    pairs: List[Tuple[str, str]] = []
+    for scene in sorted(data_dir.iterdir()):
+        if not scene.is_dir():
+            continue
+        for noisy in sorted(scene.glob("*NOISY*SRGB*.PNG")):
+            gt = scene / noisy.name.replace("NOISY", "GT")
+            if gt.exists():
+                pairs.append((str(noisy), str(gt)))
+    return pairs
+
+
+def find_polyu_pairs(root: str | Path, split: str = "CroppedImages") -> List[Tuple[str, str]]:
+    """Discover PolyU real/mean JPEG pairs.
+
+    Expected layout from PolyU-Real-World-Noisy-Images-Dataset:
+
+        <root>/CroppedImages/*_real.JPG
+        <root>/CroppedImages/*_mean.JPG
+
+    The *_real image is noisy and *_mean is the averaged clean target.
+    """
+    root = Path(root)
+    data_dir = root / split
+    if not data_dir.is_dir():
+        data_dir = root
+    pairs: List[Tuple[str, str]] = []
+    for noisy in sorted(data_dir.glob("*_real.JPG")):
+        gt = noisy.with_name(noisy.name.replace("_real.JPG", "_mean.JPG"))
+        if gt.exists():
+            pairs.append((str(noisy), str(gt)))
+    if not pairs:
+        for noisy in sorted(data_dir.glob("*_Real.JPG")):
+            gt = noisy.with_name(noisy.name.replace("_Real.JPG", "_mean.JPG"))
+            if gt.exists():
+                pairs.append((str(noisy), str(gt)))
+    return pairs
+
+
+class SIDDPatchDataset(Dataset):
+    """Random patch sampler over SIDD Medium sRGB pairs.
+
+    Each __getitem__ returns one random crop. The reported length is
+    `len(pairs) * patches_per_image` so DataLoader shuffling spreads work evenly.
+    A single-slot pair cache means consecutive accesses to the same pair_idx
+    avoid re-decoding the (huge) source PNGs — use `ChunkedShuffleSampler`
+    to ensure adjacent indices share a pair.
+
+    Output: (noisy_linear, clean_linear), both (3, H, W) float32 in linear light.
+    With exposure_jitter, values can exceed 1.0 to expose the network to HDR ranges.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        patch_size: int = 128,
+        patches_per_image: int = 8,
+        exposure_jitter: Optional[Tuple[float, float]] = (0.25, 4.0),
+        flip_rot: bool = True,
+        seed: int = 0,
+        pairs: Optional[Iterable[Tuple[str, str]]] = None,
+        synth_prob: float = 0.0,
+        gauss_sigma_max: float = 30.0,
+        poisson_lambda_range: Tuple[float, float] = (10.0, 100.0),
+        jpeg_q_range: Tuple[int, int] = (60, 100),
+        return_teacher: bool = False,
+        output_space: str = "linear",
+        randomize_each_access: bool = False,
+    ):
+        super().__init__()
+        self.pairs = list(pairs) if pairs is not None else find_sidd_pairs(root)
+        if not self.pairs:
+            raise FileNotFoundError(f"No SIDD pairs discovered under {root}")
+        if patch_size % 8 != 0:
+            raise ValueError("patch_size must be a multiple of 8")
+
+        self.patch_size = int(patch_size)
+        self.patches_per_image = int(patches_per_image)
+        self.exposure_jitter = exposure_jitter
+        self.flip_rot = bool(flip_rot)
+        self._base_seed = int(seed)
+        # Synthetic-degradation knobs (Phase 2).
+        self.synth_prob = float(synth_prob)
+        self.gauss_sigma_max = float(gauss_sigma_max)
+        self.poisson_lambda_range = (
+            float(poisson_lambda_range[0]),
+            float(poisson_lambda_range[1]),
+        )
+        self.jpeg_q_range = (int(jpeg_q_range[0]), int(jpeg_q_range[1]))
+        self.return_teacher = bool(return_teacher)
+        if output_space not in ("linear", "srgb"):
+            raise ValueError(f"output_space must be 'linear' or 'srgb', got {output_space!r}")
+        self.output_space = output_space
+        self.randomize_each_access = bool(randomize_each_access)
+        self._access_counter = 0
+        # Single-slot pair cache (per dataset instance; one per worker process).
+        self._cache_pair_idx: int = -1
+        self._cache_noisy: Optional[np.ndarray] = None
+        self._cache_gt: Optional[np.ndarray] = None
+        self._cache_teacher: Optional[np.ndarray] = None  # None if no teacher file
+
+    @staticmethod
+    def _teacher_path_for(noisy_path: str) -> Path:
+        p = Path(noisy_path)
+        if "NOISY" not in p.name:
+            return p.with_name("__missing_teacher__")
+        return p.with_name(p.name.replace("NOISY", "TEACHER"))
+
+    # ---- Length & access ----
+    def __len__(self) -> int:
+        return len(self.pairs) * self.patches_per_image
+
+    def _load(self, path: str) -> np.ndarray:
+        with Image.open(path) as im:
+            # np.array (not asarray) yields an owned, writable buffer.
+            arr = np.array(im.convert("RGB"), dtype=np.uint8)
+        return arr  # HWC uint8
+
+    def _get_pair(self, pair_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if self._cache_pair_idx != pair_idx:
+            noisy_path, gt_path = self.pairs[pair_idx]
+            self._cache_noisy = self._load(noisy_path)
+            self._cache_gt = self._load(gt_path)
+            self._cache_teacher = None
+            if self.return_teacher:
+                tpath = self._teacher_path_for(noisy_path)
+                if tpath.exists():
+                    try:
+                        self._cache_teacher = self._load(str(tpath))
+                    except (OSError, Exception):
+                        # File may be partially written by precompute_teacher.py;
+                        # treat as missing and fall back to GT-only supervision.
+                        self._cache_teacher = None
+            self._cache_pair_idx = pair_idx
+        return self._cache_noisy, self._cache_gt  # type: ignore[return-value]
+
+    def __getitem__(self, idx: int):
+        # Per-call RNG so workers stay deterministic-ish across epochs.
+        extra = 0
+        if self.randomize_each_access:
+            self._access_counter += 1
+            extra = self._access_counter * 1597334677
+        rng = np.random.default_rng((self._base_seed + idx * 2654435761 + extra) & 0xFFFFFFFF)
+
+        pair_idx = idx // self.patches_per_image
+        noisy, gt = self._get_pair(pair_idx)
+
+        H, W, _ = noisy.shape
+        ps = self.patch_size
+        if H < ps or W < ps:
+            raise RuntimeError(f"Image too small ({H}x{W}) for patch {ps}")
+
+        y = int(rng.integers(0, H - ps + 1))
+        x = int(rng.integers(0, W - ps + 1))
+        noisy_p = noisy[y : y + ps, x : x + ps]
+        gt_p = gt[y : y + ps, x : x + ps]
+
+        # Phase 2: with prob synth_prob, replace the real noisy patch with a
+        # synthetic degradation of the GT patch. The GT (target) is unchanged.
+        # This exposes the model to clean-end + non-SIDD noise distributions.
+        is_synth = self.synth_prob > 0.0 and rng.random() < self.synth_prob
+        if is_synth:
+            noisy_p = _apply_synth_degradation(
+                rng,
+                gt_p,
+                gauss_sigma_max=self.gauss_sigma_max,
+                poisson_lambda_range=self.poisson_lambda_range,
+                jpeg_q_range=self.jpeg_q_range,
+            )
+
+        # Teacher (Phase 3 distillation): only valid for REAL noisy patches that
+        # have a precomputed teacher image. Synthetic patches are out-of-domain
+        # for the teacher, so they fall back to GT-only supervision.
+        has_teacher = (
+            self.return_teacher and not is_synth and self._cache_teacher is not None
+        )
+        if self.return_teacher:
+            if has_teacher:
+                teacher_p = self._cache_teacher[y : y + ps, x : x + ps]
+            else:
+                teacher_p = gt_p  # placeholder; distill weight will be 0
+
+        def _to_tensor(arr: np.ndarray) -> torch.Tensor:
+            t = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).float().div_(255.0)
+            if self.output_space == "srgb":
+                return t
+            return srgb_to_linear(t)
+
+        noisy_t = _to_tensor(noisy_p)
+        gt_t = _to_tensor(gt_p)
+        views = [noisy_t, gt_t]
+        if self.return_teacher:
+            teacher_t = _to_tensor(teacher_p)
+            views.append(teacher_t)
+
+        # Same exposure jitter to all views (preserves noise/signal ratio).
+        if self.exposure_jitter is not None:
+            lo, hi = self.exposure_jitter
+            # Log-uniform sampling for symmetric brightness coverage.
+            scale = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            for v in views:
+                v.mul_(scale)
+
+        if self.flip_rot:
+            fx = rng.random() < 0.5
+            fy = rng.random() < 0.5
+            k = int(rng.integers(0, 4))
+            for i, v in enumerate(views):
+                if fx:
+                    v = v.flip(-1)
+                if fy:
+                    v = v.flip(-2)
+                if k:
+                    v = torch.rot90(v, k, dims=(-2, -1))
+                views[i] = v.contiguous()
+
+        if self.return_teacher:
+            return views[0], views[1], views[2], float(has_teacher)
+        return views[0], views[1]
+
+
+class ChunkedShuffleSampler(Sampler[int]):
+    """Yield dataset indices grouped into per-pair chunks, then shuffle chunks.
+
+    With `chunk_size == patches_per_image`, every chunk contains all the
+    patches sampled from one image, so a worker that processes a chunk hits
+    its pair cache for `chunk_size - 1` of its `chunk_size` calls.
+
+    `num_pairs` and `patches_per_image` must match the dataset.
+
+    A new chunk shuffle is drawn each iteration. Pass a per-epoch seed via
+    `set_epoch` if reproducibility across runs matters.
+    """
+
+    def __init__(
+        self,
+        num_pairs: int,
+        patches_per_image: int,
+        chunk_size: Optional[int] = None,
+        seed: int = 0,
+    ):
+        if chunk_size is None:
+            chunk_size = patches_per_image
+        if patches_per_image % chunk_size != 0:
+            raise ValueError("patches_per_image must be a multiple of chunk_size")
+
+        self.num_pairs = int(num_pairs)
+        self.patches_per_image = int(patches_per_image)
+        self.chunk_size = int(chunk_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.num_pairs * self.patches_per_image
+
+    def __iter__(self) -> Iterator[int]:
+        chunks_per_pair = self.patches_per_image // self.chunk_size
+        total_chunks = self.num_pairs * chunks_per_pair
+
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(total_chunks, generator=g).tolist()
+
+        for c in order:
+            pair_idx = c // chunks_per_pair
+            chunk_start = (c % chunks_per_pair) * self.chunk_size
+            base = pair_idx * self.patches_per_image + chunk_start
+            for offset in range(self.chunk_size):
+                yield base + offset
+        self.epoch += 1

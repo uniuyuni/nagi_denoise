@@ -1,0 +1,74 @@
+# NagiPerfect-S flatpush continuation with non-highlight edge luma guard.
+#
+# Purpose:
+#   flatpush_final is the current best normal SIDD-val64 checkpoint, but real
+#   photo edge HF retention drifted downward. This short continuation keeps the
+#   flat-region denoise pressure while adding an explicit non-highlight edge
+#   luma-HF matching loss.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.8]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 500
+  warmup_iters: 40
+  lr: 7.5e-7
+  lr_min: 2.5e-7
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 250
+  keep_last_ckpts: 3
+  init_checkpoint: runs/nagiperfect_perfect_s_flatpush_2k/nagiperfect_perfect_s_flatpush_2k_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 0.52
+  base_weight: 0.18
+  srgb_weight: 0.62
+  srgb_base_weight: 0.20
+  body_srgb_weight: 0.28
+  body_srgb_base_weight: 0.08
+  flat_srgb_hf_weight: 0.24
+  flat_threshold: 0.018
+  flat_transition: 0.010
+  flat_kernel_size: 9
+  edge_luma_hf_weight: 0.22
+  edge_threshold: 0.040
+  edge_transition: 0.015
+  linear_weight: 0.03
+  highlight_luma_weight: 0.13
+  highlight_chroma_weight: 0.06
+  highlight_ratio_weight: 0.05
+  detail_weight: 0.11
+  confidence_l1_weight: 0.0005
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

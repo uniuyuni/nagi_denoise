@@ -1,0 +1,48 @@
+# Nagi NR-M2: Phase 2 fine-tune of M.
+# Same architecture as M (base_channels=48, num_blocks=(4,4,8,4,4), 1.81M params).
+# Differences vs M:
+#   - Fine-tuned starting from runs/nagi_nr_m/nagi_nr_m_final.pt (--init-from)
+#   - Synthetic degradations injected on 50% of batches (Gauss / Poisson / JPEG / Gauss+JPEG)
+#     to expand the noise distribution beyond SIDD smartphone-only noise.
+#   - Loss simplified to Charbonnier(compressed) only (no FFT, no linear-space term),
+#     matching NAFNet / Restormer practice.
+#   - Lower LR (1e-4 -> 1e-6 cosine) with short warmup, 80K iters total.
+
+model:
+  in_channels: 3
+  base_channels: 48
+  num_blocks: [4, 4, 8, 4, 4]
+  asinh_k: 8.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 8
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  num_workers: 4
+  prefetch_factor: 4
+
+  # Phase 2: synthetic-degradation knobs.
+  synth_prob: 0.5                    # 50% of batches use synth instead of real SIDD pair
+  gauss_sigma_max: 30.0              # sRGB uint8 std-dev range for Gaussian noise
+  poisson_lambda_range: [10.0, 100.0]  # smaller lambda = stronger Poisson noise
+  jpeg_q_range: [60, 100]            # JPEG quality range
+
+train:
+  batch_size: 16
+  total_iters: 80000                 # ~ 1/4 of M's schedule (transfer-learning fine-tune)
+  warmup_iters: 500
+  lr: 1.0e-4                         # fine-tune LR (was 2e-4 from scratch)
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 100
+  save_every: 10000
+
+loss:
+  fft_weight: 0.0                    # NAFNet / Restormer use Charbonnier alone
+  linear_weight: 0.0                 # ditto
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3

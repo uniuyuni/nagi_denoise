@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nagi-nr-bench"
+version = "0.1.0"
+description = "Benchmark harness for Nagi NR: third-party comparators (SCUNet, NAFNet) + SIDD Validation eval."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Nagi NR" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "nagi-nr",
+    "scipy>=1.10",
+    "einops>=0.7",
+    "timm>=0.9",
+    "gdown>=5.0",
+]
+
+[project.scripts]
+nagi-eval-sidd = "nagi_nr_bench.eval_sidd_val:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

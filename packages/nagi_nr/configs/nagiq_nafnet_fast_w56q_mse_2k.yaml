@@ -1,0 +1,55 @@
+# NAFNet-Fast-W56Q short screen.
+#
+# Purpose:
+#   Quality-first middle ground after W48Q failed to learn quickly from an
+#   identity-safe head. W56Q has less theoretical speedup than W48Q but much more
+#   capacity, and is still close to the 1.5x speed target.
+
+model:
+  width: 56
+  enc_blk_nums: [2, 2, 4, 6]
+  middle_blk_num: 10
+  dec_blk_nums: [2, 2, 2, 2]
+
+data:
+  patch_size: 256
+  patches_per_image: 4
+  chunk_size: 4
+  exposure_jitter: null
+  flip_rot: true
+  randomize_each_access: true
+  num_workers: 1
+  prefetch_factor: 1
+  return_teacher: true
+  output_space: srgb
+
+train:
+  init_checkpoint: runs/nafnet_fast_w56q/nafnet_fast_w56q_from_p3_extend_best_head0.pt
+  init_state: state_dict
+  batch_size: 1
+  grad_accum_steps: 4
+  total_iters: 2000
+  warmup_iters: 300
+  lr: 8.0e-5
+  lr_min: 1.5e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.995
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 0
+
+validation:
+  enabled: true
+  every: 500
+  max_patches: 128
+  noisy_mat: data/ValidationNoisyBlocksSrgb.mat
+  gt_mat: data/ValidationGtBlocksSrgb.mat
+
+loss:
+  kind: mse_distill
+  teacher_weight_start: 0.70
+  teacher_weight_end: 0.55
+  grad_weight: 0.01
+  range_weight: 0.001
+  clamp_pred: false

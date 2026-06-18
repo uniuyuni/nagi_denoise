@@ -1,0 +1,56 @@
+# GAMAIR-M56 fast-start 128px architecture screen.
+#
+# Purpose:
+#   Test a local middle-size GAMA-IR variant between the paper's S and L sizes.
+#   This is not an official paper preset. It keeps the same U-shaped block
+#   allocation rule and raises capacity from width=42 to width=56, depth=19.
+#
+# Gate:
+#   Compare against GAMAIR-S faststart at 2k: 29.682 dB on SIDD val128.
+
+model:
+  kind: gamair
+  preset: gamair-m56
+  residual_init: 0.01
+  ending_init_std: 0.0005
+
+data:
+  patch_size: 128
+  patches_per_image: 16
+  chunk_size: 8
+  exposure_jitter: null
+  flip_rot: true
+  randomize_each_access: true
+  num_workers: 1
+  prefetch_factor: 1
+  return_teacher: true
+  output_space: srgb
+
+train:
+  batch_size: 1
+  grad_accum_steps: 4
+  total_iters: 2000
+  warmup_iters: 300
+  lr: 1.0e-4
+  lr_min: 2.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.997
+  log_every: 100
+  save_every: 0
+  keep_last_ckpts: 0
+
+validation:
+  enabled: true
+  every: 500
+  max_patches: 128
+  noisy_mat: data/ValidationNoisyBlocksSrgb.mat
+  gt_mat: data/ValidationGtBlocksSrgb.mat
+
+loss:
+  kind: mse_distill
+  teacher_weight_start: 0.30
+  teacher_weight_end: 0.10
+  grad_weight: 0.005
+  range_weight: 0.002
+  clamp_pred: false

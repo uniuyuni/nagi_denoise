@@ -1,0 +1,40 @@
+# NagiQ q48-trim sanity run.
+#
+# Purpose:
+#   Verify the new sRGB NAFNet-style student training path before committing to
+#   a 20k screening run. This is intentionally small and low-pressure for the
+#   local machine.
+
+model:
+  preset: q48-trim
+
+data:
+  patch_size: 256
+  patches_per_image: 4
+  chunk_size: 4
+  exposure_jitter: null
+  flip_rot: true
+  num_workers: 1
+  prefetch_factor: 1
+  return_teacher: true
+  output_space: srgb
+
+train:
+  batch_size: 1
+  grad_accum_steps: 4
+  total_iters: 1000
+  warmup_iters: 200
+  lr: 2.0e-4
+  lr_min: 2.0e-5
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 20
+  save_every: 500
+  keep_last_ckpts: 0
+
+loss:
+  charbonnier_eps: 1.0e-3
+  teacher_weight_start: 0.70
+  teacher_weight_end: 0.60
+  grad_weight: 0.02

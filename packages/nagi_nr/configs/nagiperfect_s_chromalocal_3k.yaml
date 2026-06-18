@@ -1,0 +1,77 @@
+# NagiPerfect-S local chroma denoise continuation.
+#
+# Purpose:
+#   Continue from the practical flatpush candidate, but avoid strictflat's RGB-wide
+#   high-frequency pressure. The visible remaining grain is mostly color noise, so
+#   this recipe damps chroma HF only inside conservative flat regions while keeping
+#   luma/detail and highlight rails active.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.8]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 3000
+  warmup_iters: 90
+  lr: 9.0e-7
+  lr_min: 1.5e-7
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 6
+  init_checkpoint: runs/nagiperfect_perfect_s_flatpush_2k/nagiperfect_perfect_s_flatpush_2k_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 0.52
+  base_weight: 0.18
+  srgb_weight: 0.60
+  srgb_base_weight: 0.20
+  body_srgb_weight: 0.24
+  body_srgb_base_weight: 0.08
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.035
+  flat_chroma_hf_weight: 0.10
+  flat_chroma_damp_weight: 0.42
+  flat_threshold: 0.010
+  flat_transition: 0.003
+  flat_kernel_size: 9
+  edge_luma_hf_weight: 0.14
+  edge_threshold: 0.034
+  edge_transition: 0.012
+  linear_weight: 0.025
+  highlight_luma_weight: 0.15
+  highlight_chroma_weight: 0.08
+  highlight_ratio_weight: 0.07
+  detail_weight: 0.14
+  confidence_l1_weight: 0.0004
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

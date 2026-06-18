@@ -1,0 +1,43 @@
+# Nagi NR-M-sRGB: loss/metric alignment A/B.
+#
+# Identical to nagi_nr_m.yaml in EVERY axis except the loss space. The benchmark
+# metric is sRGB PSNR (= MSE on sRGB uint8), but M trains Charbonnier in
+# asinh-compressed space. This run moves the primary recon + FFT terms into sRGB
+# space and uses a larger Charbonnier eps (L2-like) so the objective matches the
+# metric. Train from scratch for the same 300k iters and compare to M head-to-head.
+#
+#   pixi run train-msrgb     # then: pixi run eval-msrgb
+
+model:
+  in_channels: 3
+  base_channels: 48
+  num_blocks: [4, 4, 8, 4, 4]
+  asinh_k: 8.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 8
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  num_workers: 4
+  prefetch_factor: 4
+
+train:
+  batch_size: 16
+  total_iters: 300000
+  warmup_iters: 2000
+  lr: 2.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 100
+  save_every: 2000          # frequent so stop/resume (--resume-latest) loses <=2k steps
+
+loss:
+  recon_space: srgb          # primary Charbonnier + FFT in sRGB space (matches metric)
+  fft_weight: 0.05           # now an sRGB-space FFT-magnitude term
+  linear_weight: 0.0         # redundant with sRGB recon; off for the clean A/B
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3    # matched to M's eps -> same gradient scale -> isolates the SPACE change only

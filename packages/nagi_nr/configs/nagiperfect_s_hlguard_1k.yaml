@@ -1,0 +1,62 @@
+# NagiPerfect-S highlight-guard fine-tune.
+#
+# Purpose:
+#   Start from the stable 2k checkpoint and test whether stronger scheduled
+#   highlight luma/chroma/ratio preservation can reduce HDR highlight drift
+#   without losing all SIDD denoise gains.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 4
+  exposure_jitter: [0.45, 3.0]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.03
+  gauss_sigma_max: 10.0
+  poisson_lambda_range: [28.0, 160.0]
+  jpeg_q_range: [85, 100]
+  num_workers: 0
+
+train:
+  batch_size: 1
+  grad_accum_steps: 2
+  total_iters: 1000
+  warmup_iters: 100
+  lr: 8.0e-6
+  lr_min: 2.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 2
+  init_checkpoint: runs/nagiperfect_perfect_s_stable_2k/nagiperfect_perfect_s_stable_2k_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 0.80
+  base_weight: 0.25
+  linear_weight: 0.04
+  highlight_luma_weight: 0.30
+  highlight_luma_weight_end: 0.75
+  highlight_chroma_weight: 0.12
+  highlight_chroma_weight_end: 0.28
+  highlight_ratio_weight: 0.08
+  highlight_ratio_weight_end: 0.30
+  highlight_ramp_start: 0.15
+  highlight_ramp_end: 0.85
+  detail_weight: 0.10
+  confidence_l1_weight: 0.001
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

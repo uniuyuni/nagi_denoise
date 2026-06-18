@@ -1,0 +1,56 @@
+# NagiPerfect-S stable 2k extension from the 500-step pilot.
+#
+# Purpose:
+#   Continue after the promising 500-step pilot without the NaN seen in the
+#   aggressive basepush recipe. This keeps the architecture fixed and makes the
+#   optimizer/loss schedule safer.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 4
+  exposure_jitter: [0.35, 2.0]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.05
+  gauss_sigma_max: 12.0
+  poisson_lambda_range: [24.0, 140.0]
+  jpeg_q_range: [82, 100]
+  num_workers: 0
+
+train:
+  batch_size: 1
+  grad_accum_steps: 2
+  total_iters: 2000
+  warmup_iters: 150
+  lr: 2.0e-5
+  lr_min: 5.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.998
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 2
+  init_checkpoint: runs/nagiperfect_perfect_s_pilot_500/nagiperfect_perfect_s_pilot_500_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 1.0
+  base_weight: 0.40
+  linear_weight: 0.06
+  highlight_luma_weight: 0.18
+  highlight_chroma_weight: 0.06
+  detail_weight: 0.10
+  confidence_l1_weight: 0.001
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

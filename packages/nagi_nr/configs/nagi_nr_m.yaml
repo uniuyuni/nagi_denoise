@@ -1,0 +1,35 @@
+# Nagi NR-M: speed-first medium variant.
+# 1.81M params (vs S at 0.45M), target ~60-80 ms/patch on MPS, target ~38 dB on SIDD Validation.
+
+model:
+  in_channels: 3
+  base_channels: 48              # was 32 in S
+  num_blocks: [4, 4, 8, 4, 4]    # was (2, 2, 4, 2, 2) in S
+  asinh_k: 8.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 8
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  num_workers: 4
+  prefetch_factor: 4
+
+train:
+  batch_size: 16
+  total_iters: 300000
+  warmup_iters: 2000
+  lr: 2.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 100
+  save_every: 10000
+
+loss:
+  fft_weight: 0.05
+  linear_weight: 0.1
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3

@@ -1,0 +1,60 @@
+# GAMAIR-S 256px SIDD-only teacher restart.
+#
+# Purpose:
+#   Test whether the S model is limited by architecture or by the recent
+#   low-teacher, low-LR fine-tune recipe. Restart from the current best S model,
+#   remove PolyU for this phase, and pull more strongly toward the NAFNet teacher
+#   on SIDD.
+#
+# Gate:
+#   If this cannot move meaningfully toward 37 dB, extending GAMAIR-S further is
+#   unlikely to be the path to the 39-40 dB target.
+
+model:
+  kind: gamair
+  preset: gamair-s
+  residual_init: 0.01
+  ending_init_std: 0.0005
+
+data:
+  patch_size: 256
+  patches_per_image: 8
+  chunk_size: 4
+  exposure_jitter: null
+  flip_rot: true
+  randomize_each_access: true
+  num_workers: 1
+  prefetch_factor: 1
+  return_teacher: true
+  output_space: srgb
+
+train:
+  batch_size: 1
+  grad_accum_steps: 2
+  total_iters: 10000
+  warmup_iters: 300
+  lr: 2.0e-5
+  lr_min: 5.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.998
+  log_every: 100
+  save_every: 0
+  keep_last_ckpts: 0
+  init_checkpoint: runs/nagiq_gamair_s_polyu_256_ft_10k/nagiq_gamair_s_polyu_256_ft_10k_best.pt
+  init_state: state_dict
+
+validation:
+  enabled: true
+  every: 1000
+  max_patches: 128
+  noisy_mat: data/ValidationNoisyBlocksSrgb.mat
+  gt_mat: data/ValidationGtBlocksSrgb.mat
+
+loss:
+  kind: mse_distill
+  teacher_weight_start: 0.40
+  teacher_weight_end: 0.20
+  grad_weight: 0.005
+  range_weight: 0.002
+  clamp_pred: false

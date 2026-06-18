@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.pixi/
+.venv/
+venv/
+
+# Separately managed local clones
+packages/nafnet_applesilicon/
+
+# Experiment outputs and checkpoints
+runs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.mlmodel
+*.mlpackage/
+
+# Local datasets and bulky reference data
+SIDD_Medium_Srgb/
+PolyU-Real-World-Noisy-Images-Dataset-master/
+RENOIR/
+benchmarks/
+data/*.mat
+samples/**/*.EXR
+samples/**/*.exr
+
+# Generated image outputs kept locally for visual checks
+tests/result*.jpg
+tests/*compare*.jpg
+tests/scunet.jpg

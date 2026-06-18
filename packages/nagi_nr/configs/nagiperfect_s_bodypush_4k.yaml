@@ -1,0 +1,68 @@
+# NagiPerfect-S body/midtone denoise fine-tune.
+#
+# Purpose:
+#   Continue from denoisepush_5k, but avoid simply increasing the global
+#   denoise pressure. The 5k checkpoint improved SIDD denoising strongly, while
+#   HDR top-luma HF retention started to drop. This recipe adds sRGB supervision
+#   only outside the highlight mask, so dark/midtone residual noise is pushed
+#   harder without asking the model to rewrite bright lines and HDR peaks.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.8]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 4000
+  warmup_iters: 120
+  lr: 4.0e-6
+  lr_min: 5.0e-7
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 1000
+  keep_last_ckpts: 3
+  init_checkpoint: runs/nagiperfect_perfect_s_denoisepush_5k/nagiperfect_perfect_s_denoisepush_5k_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 0.58
+  base_weight: 0.20
+  srgb_weight: 0.75
+  srgb_base_weight: 0.25
+  body_srgb_weight: 0.45
+  body_srgb_base_weight: 0.15
+  linear_weight: 0.03
+  highlight_luma_weight: 0.10
+  highlight_chroma_weight: 0.04
+  highlight_ratio_weight: 0.03
+  detail_weight: 0.08
+  confidence_l1_weight: 0.0005
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3
