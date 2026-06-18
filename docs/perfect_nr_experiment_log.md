@@ -1290,3 +1290,55 @@ while making luma HF ratio rise and edge retention fall. The current best
 numeric checkpoint is `strictflat_final`; the better practical image-quality
 candidate is still likely `flatpush_final` or an intermediate checkpoint,
 pending visual inspection.
+
+## Local chroma denoise continuation
+
+Strict-flat improved SIDD but kept eroding real-photo detail, so a more local
+chroma-focused recipe was added:
+
+```text
+packages/nagi_nr/configs/nagiperfect_s_chromalocal_3k.yaml
+```
+
+The recipe starts from `flatpush_final`, removes RGB-wide flat HF pressure, and
+uses flat-region chroma HF/damping terms instead. The hypothesis was that the
+remaining zoom-visible grain is mostly chroma noise, so luma/detail should not
+be pushed as hard.
+
+Run:
+
+```text
+runs/nagiperfect_perfect_s_chromalocal_3k/
+```
+
+The run was stopped after the 1000 checkpoint evaluation because the effect was
+too small to justify continuing to 3000.
+
+SIDD val64:
+
+| checkpoint | PSNR in | PSNR out | delta |
+| --- | ---: | ---: | ---: |
+| flatpush final | 19.6810 | 22.5157 | +2.8348 |
+| chromalocal 500 | 19.6810 | 22.5255 | +2.8445 |
+| chromalocal 1000 | 19.6810 | 22.5504 | +2.8694 |
+
+Cat 1024 crop real-photo evaluator, strict mask
+(`flat_hf_threshold=0.01`, `flat_edge_threshold=0.018`, `edge_threshold=0.04`):
+
+| checkpoint | flat luma ratio | flat chroma ratio | edge HF retention | highlight chroma drift |
+| --- | ---: | ---: | ---: | ---: |
+| bodypush 2000 | 1.232 | 0.881 | 0.850 | 0.024602 |
+| flatpush final | 1.271 | 0.872 | 0.842 | 0.026435 |
+| strictflat 3000 | 1.291 | 0.865 | 0.835 | 0.027283 |
+| chromalocal 500 | 1.271 | 0.872 | 0.841 | 0.026576 |
+| chromalocal 1000 | 1.273 | 0.870 | 0.840 | 0.026803 |
+
+Interpretation:
+
+`chromalocal` is safer than strict-flat but barely moves the visible chroma
+noise. It gives a small SIDD gain and a tiny flat-chroma improvement, while
+edge retention and highlight drift already begin moving in the wrong direction.
+Conclusion: continuing the same backbone/loss pressure is not enough. The next
+useful step should change the mechanism, not just train longer. Either add a
+deterministic/local postprocess path, or give the model an explicit masked
+chroma-smoothing output with a stronger teacher target and a preservation gate.
