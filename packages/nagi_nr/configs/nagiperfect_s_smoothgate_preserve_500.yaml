@@ -1,0 +1,92 @@
+# NagiPerfect-S smoothgate color-preservation continuation.
+#
+# Purpose:
+#   Start from the strong smoothgate 1500 checkpoint, lower deterministic
+#   smoothing strength to 0.55, and add gate L1 pressure so the smoother stays
+#   selective. This is intended to keep most of the chroma-noise reduction while
+#   reducing the color/highlight drift seen at raw strength 0.75.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+  chroma_gate_threshold: 0.010
+  chroma_gate_transition: 0.006
+  chroma_gate_kernel_size: 9
+  chroma_gate_highlight_threshold: 1.0
+  chroma_gate_highlight_transition: 0.2
+  chroma_gate_strength: 1.0
+  chroma_smooth_branch: true
+  chroma_smooth_strength: 0.55
+  chroma_smooth_kernel_size: 9
+  chroma_smooth_gate_bias: -4.0
+  chroma_smooth_gate_scale: 1.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.8]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 500
+  warmup_iters: 30
+  lr: 5.0e-4
+  lr_min: 5.0e-5
+  weight_decay: 0.0
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 250
+  keep_last_ckpts: 4
+  init_checkpoint: runs/nagiperfect_perfect_s_smoothgate_3k/nagiperfect_perfect_s_smoothgate_3k_0001500.pt
+  init_state: state_dict
+  init_strict: true
+  freeze_for_chroma_branch: true
+
+loss:
+  final_weight: 0.03
+  base_weight: 0.0
+  srgb_weight: 0.04
+  srgb_base_weight: 0.0
+  body_srgb_weight: 0.03
+  body_srgb_base_weight: 0.0
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.001
+  flat_chroma_hf_weight: 0.0
+  flat_chroma_damp_weight: 0.0
+  flat_chroma_distill_weight: 3.0
+  flat_chroma_delta_distill_weight: 8.0
+  flat_chroma_distill_strength: 0.55
+  flat_chroma_distill_kernel_size: 9
+  chroma_smooth_gate_l1_weight: 0.10
+  flat_threshold: 0.010
+  flat_transition: 0.006
+  flat_kernel_size: 9
+  linear_weight: 0.001
+  highlight_luma_weight: 0.12
+  highlight_chroma_weight: 0.10
+  highlight_ratio_weight: 0.05
+  detail_weight: 0.02
+  confidence_l1_weight: 0.0
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

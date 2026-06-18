@@ -253,6 +253,7 @@ class NagiPerfectLoss(nn.Module):
         flat_chroma_distill_strength: float = 0.5,
         flat_chroma_distill_kernel_size: int = 9,
         flat_chroma_delta_distill_weight: float = 0.0,
+        chroma_smooth_gate_l1_weight: float = 0.0,
         edge_luma_hf_weight: float = 0.0,
         edge_threshold: float = 0.040,
         edge_transition: float = 0.015,
@@ -292,6 +293,7 @@ class NagiPerfectLoss(nn.Module):
         self.flat_chroma_distill_strength = float(flat_chroma_distill_strength)
         self.flat_chroma_distill_kernel_size = int(flat_chroma_distill_kernel_size)
         self.flat_chroma_delta_distill_weight = float(flat_chroma_delta_distill_weight)
+        self.chroma_smooth_gate_l1_weight = float(chroma_smooth_gate_l1_weight)
         self.edge_luma_hf_weight = float(edge_luma_hf_weight)
         self.edge_threshold = float(edge_threshold)
         self.edge_transition = float(edge_transition)
@@ -572,6 +574,12 @@ class NagiPerfectLoss(nn.Module):
             loss_delta_distill = loss_delta_distill / (distill_mask_mean * distill_mask.numel() * 3.0)
             total = total + self.flat_chroma_delta_distill_weight * loss_delta_distill
             out["flat_chroma_delta_distill"] = loss_delta_distill.detach()
+
+        if self.chroma_smooth_gate_l1_weight > 0 and isinstance(pred, dict) and "chroma_smooth_gate" in pred:
+            gate = pred["chroma_smooth_gate"]
+            loss_gate_l1 = gate.abs().mean()
+            total = total + self.chroma_smooth_gate_l1_weight * loss_gate_l1
+            out["chroma_smooth_gate_l1"] = loss_gate_l1.detach()
 
         highlight_luma_weight = self._scheduled_weight(
             self.highlight_luma_weight,

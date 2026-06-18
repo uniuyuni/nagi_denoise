@@ -1433,3 +1433,42 @@ quality-first use, the practical shortlist is now:
 
 The next training recipe should reduce highlight/color drift at the source,
 not keep increasing smoothing strength.
+
+### Smoothgate preserve attempt
+
+Added a short preserve recipe:
+
+```text
+packages/nagi_nr/configs/nagiperfect_s_smoothgate_preserve_500.yaml
+```
+
+It starts from `smoothgate_1500`, sets `chroma_smooth_strength=0.55`, adds
+`chroma_smooth_gate_l1_weight`, and increases color-preservation weights. The
+intent was to keep the trained gate but shrink unnecessary smoothing.
+
+The run stopped at step 337 due to non-finite loss; checkpoint 250 was still
+available and evaluated.
+
+SIDD val64:
+
+| checkpoint | PSNR in | PSNR out | delta |
+| --- | ---: | ---: | ---: |
+| smoothgate preserve 250 | 19.6810 | 22.6656 | +2.9847 |
+
+Cat 1024 crop, strict mask:
+
+| candidate | flat luma ratio | flat chroma ratio | flat chroma reduction | edge HF retention | highlight chroma drift |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| smoothgate 1000 | 1.268 | 0.747 | 25.3% | 0.841 | 0.029150 |
+| smoothgate 1500 strength 0.55 | 1.267 | 0.722 | 27.8% | 0.841 | 0.029498 |
+| smoothgate preserve 250 | 1.267 | 0.727 | 27.3% | 0.841 | 0.029379 |
+
+Interpretation:
+
+The preserve idea is directionally plausible but not yet worth replacing the
+simple inference-strength override. It gives a tiny drift improvement compared
+with `smoothgate_1500_s055`, but also slightly less chroma reduction and had a
+non-finite training event. If revisited, lower LR substantially and add loss
+guards around the gate/sRGB conversion path. Current practical best remains
+`smoothgate_1500` with `--chroma-smooth-strength 0.55`, with `smoothgate_1000`
+as the conservative fallback.
