@@ -89,6 +89,7 @@ def smooth_chroma(
     transition: float,
     highlight_threshold: float,
     highlight_transition: float,
+    hdr_restore_peak_threshold: float,
     hdr_restore_threshold: float,
     hdr_restore_transition: float,
 ) -> tuple[np.ndarray, dict, np.ndarray]:
@@ -109,8 +110,13 @@ def smooth_chroma(
     out_srgb = y + chroma * (1.0 - blend) + low_chroma * blend
     out = srgb_to_linear_np(out_srgb)
     y_linear = luma(base, LUMA_LINEAR)
+    peak_linear = np.max(base, axis=2)
+    hdr_signal = np.maximum(
+        y_linear - float(hdr_restore_threshold),
+        peak_linear - float(hdr_restore_peak_threshold),
+    )
     hdr_restore = smoothstep(
-        (y_linear - float(hdr_restore_threshold)) / max(float(hdr_restore_transition), 1.0e-6)
+        hdr_signal / max(float(hdr_restore_transition), 1.0e-6)
     )
     out = out * (1.0 - hdr_restore[..., None]) + base * hdr_restore[..., None]
     stats = {
@@ -121,6 +127,7 @@ def smooth_chroma(
         "transition": float(transition),
         "highlight_threshold": float(highlight_threshold),
         "highlight_transition": float(highlight_transition),
+        "hdr_restore_peak_threshold": float(hdr_restore_peak_threshold),
         "gate_mean": float(np.mean(gate)),
         "gate_p50": float(np.quantile(gate, 0.50)),
         "gate_p90": float(np.quantile(gate, 0.90)),
@@ -143,6 +150,7 @@ def main() -> None:
     parser.add_argument("--transition", type=float, default=0.006)
     parser.add_argument("--highlight-threshold", type=float, default=1.0)
     parser.add_argument("--highlight-transition", type=float, default=0.2)
+    parser.add_argument("--hdr-restore-peak-threshold", type=float, default=0.95)
     parser.add_argument("--hdr-restore-threshold", type=float, default=0.85)
     parser.add_argument("--hdr-restore-transition", type=float, default=0.25)
     args = parser.parse_args()
@@ -162,6 +170,7 @@ def main() -> None:
         transition=args.transition,
         highlight_threshold=args.highlight_threshold,
         highlight_transition=args.highlight_transition,
+        hdr_restore_peak_threshold=args.hdr_restore_peak_threshold,
         hdr_restore_threshold=args.hdr_restore_threshold,
         hdr_restore_transition=args.hdr_restore_transition,
     )
