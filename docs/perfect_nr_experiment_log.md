@@ -1342,3 +1342,59 @@ Conclusion: continuing the same backbone/loss pressure is not enough. The next
 useful step should change the mechanism, not just train longer. Either add a
 deterministic/local postprocess path, or give the model an explicit masked
 chroma-smoothing output with a stronger teacher target and a preservation gate.
+
+## Masked chroma smooth gate
+
+Added an explicit bounded chroma smoother inside `NagiPerfect`:
+
+```text
+packages/nagi_nr/configs/nagiperfect_s_smoothgate_3k.yaml
+```
+
+Unlike the earlier free `chroma_branch`, this branch predicts only a one-channel
+gate. The operation itself is deterministic: in flat non-highlight regions,
+display-space chroma is blended toward its local lowpass, then converted back to
+linear RGB. The main denoiser is frozen; only `chroma_smooth_head` trains
+(`289` parameters). This directly tests whether model-integrated local chroma
+smoothing can remove the visible color grain without eroding luma detail.
+
+Run:
+
+```text
+runs/nagiperfect_perfect_s_smoothgate_3k/
+```
+
+Stopped after evaluating the 1500 checkpoint because chroma reduction kept
+improving, but highlight chroma drift also rose. The useful candidates are 1000
+and 1500, not an unbounded continuation.
+
+SIDD val64:
+
+| checkpoint | PSNR in | PSNR out | delta |
+| --- | ---: | ---: | ---: |
+| flatpush final | 19.6810 | 22.5157 | +2.8348 |
+| smoothgate 500 | 19.6810 | 22.5508 | +2.8698 |
+| smoothgate 1000 | 19.6810 | 22.6438 | +2.9628 |
+| smoothgate 1500 | 19.6810 | 22.7201 | +3.0392 |
+
+Cat 1024 crop real-photo evaluator, strict mask
+(`flat_hf_threshold=0.01`, `flat_edge_threshold=0.018`, `edge_threshold=0.04`):
+
+| checkpoint | flat luma ratio | flat chroma ratio | flat chroma reduction | edge HF retention | highlight chroma drift |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| bodypush 2000 | 1.232 | 0.881 | 11.9% | 0.850 | 0.024602 |
+| flatpush final | 1.271 | 0.872 | 12.8% | 0.842 | 0.026435 |
+| smoothgate 500 | 1.270 | 0.840 | 16.0% | 0.841 | 0.026852 |
+| smoothgate 1000 | 1.268 | 0.747 | 25.3% | 0.841 | 0.029150 |
+| smoothgate 1500 | 1.266 | 0.669 | 33.1% | 0.840 | 0.031135 |
+
+Interpretation:
+
+This is the first model-side experiment that clearly attacks the real-photo
+flat chroma noise without the strict-flat edge-retention collapse. Edge HF
+stays essentially flat (`0.842 -> 0.840/0.841`) while flat chroma drops far more
+than any previous learned recipe. The trade-off is low-frequency/highlight
+color drift: 1000 is likely the balanced checkpoint, while 1500 is the stronger
+denoise candidate if visual color shift is acceptable. Next useful work is not
+more plain continuation; it is a controlled strength sweep or a highlight/color
+preservation term specifically for the smooth gate.
