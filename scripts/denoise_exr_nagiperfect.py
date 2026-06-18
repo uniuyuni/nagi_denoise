@@ -227,6 +227,7 @@ def main() -> None:
     parser.add_argument("--highlight-protect-threshold", type=float, default=None)
     parser.add_argument("--highlight-protect-transition", type=float, default=None)
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
+    parser.add_argument("--chroma-smooth-strength", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
     parser.add_argument("--tile-overlap", type=int, default=64)
     parser.add_argument("--fast", action="store_true", help="Skip auxiliary diagnostic tensors for faster inference.")
@@ -248,6 +249,8 @@ def main() -> None:
         model.highlight_protect_transition = float(args.highlight_protect_transition)
     if args.highlight_protect_strength is not None:
         model.highlight_protect_strength = float(args.highlight_protect_strength)
+    if args.chroma_smooth_strength is not None and hasattr(model, "chroma_smooth_strength"):
+        model.chroma_smooth_strength = float(args.chroma_smooth_strength)
     output, extras = run_tiled_image(
         model,
         image,
@@ -292,6 +295,11 @@ def main() -> None:
             "mask_mean": float(np.mean(extras["highlight_guard"])),
             "mask_p95": float(np.percentile(extras["highlight_guard"], 95)),
             "mask_p99": float(np.percentile(extras["highlight_guard"], 99)),
+        },
+        "chroma_smooth": {
+            "enabled": bool(getattr(model, "chroma_smooth_branch", False)),
+            "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
+            "kernel_size": int(getattr(model, "chroma_smooth_kernel_size", 0)),
         },
         "tiling": {
             "tile_size": int(args.tile_size),

@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--highlight-protect-threshold", type=float, default=None)
     parser.add_argument("--highlight-protect-transition", type=float, default=None)
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
+    parser.add_argument("--chroma-smooth-strength", type=float, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -56,6 +57,8 @@ def main() -> None:
         model.highlight_protect_transition = float(args.highlight_protect_transition)
     if args.highlight_protect_strength is not None:
         model.highlight_protect_strength = float(args.highlight_protect_strength)
+    if args.chroma_smooth_strength is not None and hasattr(model, "chroma_smooth_strength"):
+        model.chroma_smooth_strength = float(args.chroma_smooth_strength)
     noisy = _mat_array(args.noisy_mat)
     gt = _mat_array(args.gt_mat)
     if noisy.shape != gt.shape:
@@ -90,6 +93,10 @@ def main() -> None:
             "threshold": model.highlight_protect_threshold,
             "transition": model.highlight_protect_transition,
             "strength": model.highlight_protect_strength,
+        },
+        "chroma_smooth": {
+            "enabled": bool(getattr(model, "chroma_smooth_branch", False)),
+            "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
         },
     }
     text = json.dumps(result, indent=2)

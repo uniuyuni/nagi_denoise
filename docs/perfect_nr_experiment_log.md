@@ -1398,3 +1398,38 @@ color drift: 1000 is likely the balanced checkpoint, while 1500 is the stronger
 denoise candidate if visual color shift is acceptable. Next useful work is not
 more plain continuation; it is a controlled strength sweep or a highlight/color
 preservation term specifically for the smooth gate.
+
+### Smoothgate inference strength sweep
+
+Added inference-time `--chroma-smooth-strength` overrides to:
+
+```text
+scripts/denoise_exr_nagiperfect.py
+scripts/eval_nagiperfect_sidd_val.py
+```
+
+This allows the trained gate to be reused with a lower deterministic smoothing
+strength, separating "where to smooth" from "how strongly to smooth".
+
+Cat 1024 crop, strict mask, using the 1500 checkpoint with lower strengths:
+
+| candidate | flat luma ratio | flat chroma ratio | flat chroma reduction | edge HF retention | highlight chroma drift |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| flatpush final | 1.271 | 0.872 | 12.8% | 0.842 | 0.026435 |
+| smoothgate 1000 | 1.268 | 0.747 | 25.3% | 0.841 | 0.029150 |
+| smoothgate 1500 strength 0.55 | 1.267 | 0.722 | 27.8% | 0.841 | 0.029498 |
+| smoothgate 1500 strength 0.65 | 1.266 | 0.695 | 30.5% | 0.841 | 0.030296 |
+| smoothgate 1500 strength 0.75 | 1.266 | 0.669 | 33.1% | 0.840 | 0.031135 |
+
+Interpretation:
+
+Strength override works cleanly. `smoothgate_1500_s055` is a better balanced
+candidate than raw 1500: it beats 1000 on chroma reduction while keeping almost
+the same edge retention and only a small additional highlight-chroma drift. For
+quality-first use, the practical shortlist is now:
+
+1. `smoothgate_1000` for conservative color stability.
+2. `smoothgate_1500` with `--chroma-smooth-strength 0.55` for stronger denoise.
+
+The next training recipe should reduce highlight/color drift at the source,
+not keep increasing smoothing strength.
