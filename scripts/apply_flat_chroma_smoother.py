@@ -53,6 +53,11 @@ def sigmoid01(x: np.ndarray) -> np.ndarray:
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32, copy=False)
 
 
+def smoothstep(x: np.ndarray) -> np.ndarray:
+    t = np.clip(x, 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32, copy=False)
+
+
 def flat_gate(
     base_linear: np.ndarray,
     *,
@@ -84,6 +89,8 @@ def smooth_chroma(
     transition: float,
     highlight_threshold: float,
     highlight_transition: float,
+    hdr_restore_threshold: float,
+    hdr_restore_transition: float,
 ) -> tuple[np.ndarray, dict, np.ndarray]:
     base = _safe_rgb(base_linear)
     base_srgb = np.clip(linear_to_srgb_np(base), 0.0, 1.0)
@@ -101,6 +108,11 @@ def smooth_chroma(
     blend = np.clip(gate * float(strength), 0.0, 1.0)[..., None]
     out_srgb = y + chroma * (1.0 - blend) + low_chroma * blend
     out = srgb_to_linear_np(out_srgb)
+    y_linear = luma(base, LUMA_LINEAR)
+    hdr_restore = smoothstep(
+        (y_linear - float(hdr_restore_threshold)) / max(float(hdr_restore_transition), 1.0e-6)
+    )
+    out = out * (1.0 - hdr_restore[..., None]) + base * hdr_restore[..., None]
     stats = {
         "strength": float(strength),
         "chroma_sigma": float(chroma_sigma),
@@ -113,6 +125,8 @@ def smooth_chroma(
         "gate_p50": float(np.quantile(gate, 0.50)),
         "gate_p90": float(np.quantile(gate, 0.90)),
         "gate_p99": float(np.quantile(gate, 0.99)),
+        "hdr_restore_mean": float(np.mean(hdr_restore)),
+        "hdr_restore_p99": float(np.quantile(hdr_restore, 0.99)),
     }
     return out.astype(np.float32, copy=False), stats, gate
 
@@ -129,6 +143,8 @@ def main() -> None:
     parser.add_argument("--transition", type=float, default=0.006)
     parser.add_argument("--highlight-threshold", type=float, default=1.0)
     parser.add_argument("--highlight-transition", type=float, default=0.2)
+    parser.add_argument("--hdr-restore-threshold", type=float, default=0.85)
+    parser.add_argument("--hdr-restore-transition", type=float, default=0.25)
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -146,6 +162,8 @@ def main() -> None:
         transition=args.transition,
         highlight_threshold=args.highlight_threshold,
         highlight_transition=args.highlight_transition,
+        hdr_restore_threshold=args.hdr_restore_threshold,
+        hdr_restore_transition=args.hdr_restore_transition,
     )
 
     exr_path = out_dir / f"{name}.exr"

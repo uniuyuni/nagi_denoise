@@ -247,6 +247,7 @@ def main() -> None:
     parser.add_argument("--highlight-protect-transition", type=float, default=None)
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-strength", type=float, default=None)
+    parser.add_argument("--chroma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
@@ -272,6 +273,9 @@ def main() -> None:
         model.highlight_protect_strength = float(args.highlight_protect_strength)
     if args.chroma_smooth_strength is not None and hasattr(model, "chroma_smooth_strength"):
         model.chroma_smooth_strength = float(args.chroma_smooth_strength)
+    if args.chroma_smooth_gate_bias is not None and getattr(model, "chroma_smooth_head", None) is not None:
+        with torch.no_grad():
+            model.chroma_smooth_head.bias.fill_(float(args.chroma_smooth_gate_bias))
     if args.luma_smooth_strength is not None and hasattr(model, "luma_smooth_strength"):
         model.luma_smooth_strength = float(args.luma_smooth_strength)
     if args.luma_smooth_gate_bias is not None and getattr(model, "luma_smooth_head", None) is not None:
@@ -338,6 +342,7 @@ def main() -> None:
             "enabled": bool(getattr(model, "chroma_smooth_branch", False)),
             "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
             "kernel_size": int(getattr(model, "chroma_smooth_kernel_size", 0)),
+            "gate_bias_override": args.chroma_smooth_gate_bias,
         },
         "luma_smooth": {
             "enabled": bool(getattr(model, "luma_smooth_branch", False)),
