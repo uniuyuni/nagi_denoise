@@ -54,6 +54,59 @@ def heuristic_chroma_gate(
     return (flat * (1.0 - highlight)).clamp(0.0, 1.0)
 
 
+def adaptive_chroma_gate(
+    x_linear: torch.Tensor,
+    *,
+    detail_kernel_size: int = 9,
+    mild_threshold: float = 0.014,
+    strong_threshold: float = 0.018,
+    xstrong_threshold: float = 0.024,
+    transition: float = 0.010,
+    highlight_threshold: float = 1.0,
+    highlight_transition: float = 0.2,
+    color_edge_threshold: float = 0.018,
+    color_edge_transition: float = 0.010,
+    chroma_threshold: float = 0.090,
+    chroma_transition: float = 0.050,
+    xstrong_gain: float = 1.10,
+    mild_gain: float = 0.70,
+) -> torch.Tensor:
+    """Adaptive teacher that chooses mild/strong/xstrong chroma NR locally.
+
+    Flat, low-saturation regions get the strongest chroma cleanup. Color
+    boundaries and saturated regions are pulled toward mild to avoid bleeding
+    real color detail.
+    """
+
+    x = x_linear.clamp_min(0.0)
+    display = linear_to_srgb(x).clamp(0.0, 1.0)
+    y = srgb_luma(display)
+    chroma = display - y
+    detail = (y - local_lowpass(y, int(detail_kernel_size))).abs()
+    chroma_mag = chroma.abs().mean(dim=1, keepdim=True)
+    chroma_detail = (chroma - local_lowpass(chroma, int(detail_kernel_size))).abs().mean(dim=1, keepdim=True)
+
+    mild = torch.sigmoid((float(mild_threshold) - detail) / max(float(transition), 1.0e-6))
+    strong = torch.sigmoid((float(strong_threshold) - detail) / max(float(transition), 1.0e-6))
+    xstrong = torch.sigmoid((float(xstrong_threshold) - detail) / max(float(transition), 1.0e-6))
+
+    color_edge = torch.sigmoid(
+        (chroma_detail - float(color_edge_threshold)) / max(float(color_edge_transition), 1.0e-6)
+    )
+    saturated = torch.sigmoid((chroma_mag - float(chroma_threshold)) / max(float(chroma_transition), 1.0e-6))
+    risky_color = torch.maximum(color_edge, saturated)
+
+    safe_flat = (1.0 - risky_color) * xstrong * float(xstrong_gain)
+    risky_flat = risky_color * mild * float(mild_gain)
+    gate = safe_flat + risky_flat
+
+    y_linear = linear_luma(x)
+    highlight = torch.sigmoid(
+        (y_linear - float(highlight_threshold)) / max(float(highlight_transition), 1.0e-6)
+    )
+    return (gate * (1.0 - highlight)).clamp(0.0, 1.0)
+
+
 class ChromaGuardBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()

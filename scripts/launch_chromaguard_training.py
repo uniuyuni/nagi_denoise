@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 VARIANTS = {
+    "chromaguard_adaptive_s_1k": "packages/nagi_nr/configs/chromaguard_adaptive_s_1k.yaml",
     "chromaguard_s_1k": "packages/nagi_nr/configs/chromaguard_s_1k.yaml",
 }
 

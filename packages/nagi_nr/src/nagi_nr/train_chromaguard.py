@@ -13,7 +13,7 @@ import yaml
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from .chromaguard import ChromaGuard, heuristic_chroma_gate
+from .chromaguard import ChromaGuard, adaptive_chroma_gate, heuristic_chroma_gate
 from .data import ChunkedShuffleSampler, SIDDPatchDataset, find_polyu_pairs, find_sidd_pairs
 from .devices import resolve_device
 
@@ -134,7 +134,8 @@ def main() -> None:
     prefix = args.ckpt_prefix
     opt = AdamW(model.parameters(), lr=lr, weight_decay=float(train_cfg.get("weight_decay", 0.0)))
 
-    teacher_cfg = cfg["teacher"]
+    teacher_cfg = dict(cfg["teacher"])
+    teacher_kind = str(teacher_cfg.pop("kind", "fixed"))
     start_step = 0
     if args.resume_latest:
         ckpt_path = latest_checkpoint(out_dir, prefix)
@@ -167,7 +168,12 @@ def main() -> None:
         noisy, _clean = next(data_iter)
         noisy = noisy.to(device, non_blocking=True)
         with torch.no_grad():
-            target = heuristic_chroma_gate(noisy, **teacher_cfg)
+            if teacher_kind == "adaptive":
+                target = adaptive_chroma_gate(noisy, **teacher_cfg)
+            elif teacher_kind == "fixed":
+                target = heuristic_chroma_gate(noisy, **teacher_cfg)
+            else:
+                raise ValueError(f"unknown teacher kind: {teacher_kind!r}")
         pred = model(noisy)
         loss_mse = torch.mean((pred - target).pow(2))
         loss_smooth = torch.mean(torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])) + torch.mean(
