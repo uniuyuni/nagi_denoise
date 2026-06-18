@@ -50,6 +50,16 @@ def load_model(weights: Path, device: torch.device, state_key: str) -> NagiPerfe
                 "chroma_branch_width": model.chroma_branch_width,
                 "chroma_branch_blocks": model.chroma_branch_blocks,
                 "chroma_branch_use_input": model.chroma_branch_use_input,
+                "chroma_smooth_branch": model.chroma_smooth_branch,
+                "chroma_smooth_strength": model.chroma_smooth_strength,
+                "chroma_smooth_kernel_size": model.chroma_smooth_kernel_size,
+                "chroma_smooth_gate_bias": model.chroma_smooth_gate_bias,
+                "chroma_smooth_gate_scale": model.chroma_smooth_gate_scale,
+                "luma_smooth_branch": model.luma_smooth_branch,
+                "luma_smooth_strength": model.luma_smooth_strength,
+                "luma_smooth_kernel_size": model.luma_smooth_kernel_size,
+                "luma_smooth_gate_bias": model.luma_smooth_gate_bias,
+                "luma_smooth_gate_scale": model.luma_smooth_gate_scale,
             }
             merged.update(model_cfg)
             model = NagiPerfect(**merged)
@@ -77,6 +87,9 @@ def run_full_image(model: NagiPerfect, image: np.ndarray, device: torch.device) 
         "detail_applied": aux["detail_applied"].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32),
         "highlight_guard": aux["highlight_guard"].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32),
     }
+    for key in ("chroma_smooth_gate", "luma_smooth_gate"):
+        if key in aux:
+            extras[key] = aux[key].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
     return out, extras
 
 
@@ -169,6 +182,10 @@ def run_tiled_image(
         "detail_applied": np.zeros((h, w), dtype=np.float32),
         "highlight_guard": np.zeros((h, w), dtype=np.float32),
     } if diagnostics else {}
+    if diagnostics and getattr(model, "chroma_smooth_branch", False):
+        extras_accum["chroma_smooth_gate"] = np.zeros((h, w), dtype=np.float32)
+    if diagnostics and getattr(model, "luma_smooth_branch", False):
+        extras_accum["luma_smooth_gate"] = np.zeros((h, w), dtype=np.float32)
     total = len(y_starts) * len(x_starts)
     done = 0
 
@@ -192,6 +209,8 @@ def run_tiled_image(
             accum[y0:y1, x0:x1] += out * win3
             weight[y0:y1, x0:x1] += win3
             for key in extras_accum:
+                if key not in aux:
+                    continue
                 arr = aux[key].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
                 extras_accum[key][y0:y1, x0:x1] += arr * win
             done += 1
@@ -228,6 +247,8 @@ def main() -> None:
     parser.add_argument("--highlight-protect-transition", type=float, default=None)
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-strength", type=float, default=None)
+    parser.add_argument("--luma-smooth-strength", type=float, default=None)
+    parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
     parser.add_argument("--tile-overlap", type=int, default=64)
     parser.add_argument("--fast", action="store_true", help="Skip auxiliary diagnostic tensors for faster inference.")
@@ -251,6 +272,11 @@ def main() -> None:
         model.highlight_protect_strength = float(args.highlight_protect_strength)
     if args.chroma_smooth_strength is not None and hasattr(model, "chroma_smooth_strength"):
         model.chroma_smooth_strength = float(args.chroma_smooth_strength)
+    if args.luma_smooth_strength is not None and hasattr(model, "luma_smooth_strength"):
+        model.luma_smooth_strength = float(args.luma_smooth_strength)
+    if args.luma_smooth_gate_bias is not None and getattr(model, "luma_smooth_head", None) is not None:
+        with torch.no_grad():
+            model.luma_smooth_head.bias.fill_(float(args.luma_smooth_gate_bias))
     output, extras = run_tiled_image(
         model,
         image,
@@ -265,6 +291,8 @@ def main() -> None:
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
     preview_path = out_dir / f"{name}_nagiperfect_preview.png"
     confidence_path = out_dir / f"{name}_detail_confidence.png"
+    chroma_smooth_gate_path = out_dir / f"{name}_chroma_smooth_gate.png"
+    luma_smooth_gate_path = out_dir / f"{name}_luma_smooth_gate.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
 
     write_exr(exr_path, output)
@@ -273,6 +301,14 @@ def main() -> None:
     if "detail_confidence" in extras:
         Image.fromarray((np.clip(extras["detail_confidence"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
             confidence_path
+        )
+    if "chroma_smooth_gate" in extras:
+        Image.fromarray((np.clip(extras["chroma_smooth_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            chroma_smooth_gate_path
+        )
+    if "luma_smooth_gate" in extras:
+        Image.fromarray((np.clip(extras["luma_smooth_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            luma_smooth_gate_path
         )
 
     meta = {
@@ -285,6 +321,8 @@ def main() -> None:
             "tiff": str(tiff_path),
             "preview": str(preview_path),
             "detail_confidence": str(confidence_path) if "detail_confidence" in extras else None,
+            "chroma_smooth_gate": str(chroma_smooth_gate_path) if "chroma_smooth_gate" in extras else None,
+            "luma_smooth_gate": str(luma_smooth_gate_path) if "luma_smooth_gate" in extras else None,
         },
         "input_stats": image_stats(image),
         "output_stats": image_stats(output),
@@ -301,6 +339,12 @@ def main() -> None:
             "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
             "kernel_size": int(getattr(model, "chroma_smooth_kernel_size", 0)),
         },
+        "luma_smooth": {
+            "enabled": bool(getattr(model, "luma_smooth_branch", False)),
+            "strength": float(getattr(model, "luma_smooth_strength", 0.0)),
+            "kernel_size": int(getattr(model, "luma_smooth_kernel_size", 0)),
+            "gate_bias_override": args.luma_smooth_gate_bias,
+        },
         "tiling": {
             "tile_size": int(args.tile_size),
             "tile_overlap": int(args.tile_overlap),
@@ -311,6 +355,15 @@ def main() -> None:
         meta["detail_confidence_mean"] = float(np.mean(extras["detail_confidence"]))
     if "detail_applied" in extras:
         meta["detail_applied_abs_mean"] = float(np.mean(np.abs(extras["detail_applied"])))
+    for key in ("chroma_smooth_gate", "luma_smooth_gate"):
+        if key in extras:
+            meta[key] = {
+                "mean": float(np.mean(extras[key])),
+                "p50": float(np.percentile(extras[key], 50)),
+                "p90": float(np.percentile(extras[key], 90)),
+                "p99": float(np.percentile(extras[key], 99)),
+                "max": float(np.max(extras[key])),
+            }
     json_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))
     print(f"wrote {exr_path}")

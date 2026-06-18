@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--highlight-protect-transition", type=float, default=None)
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-strength", type=float, default=None)
+    parser.add_argument("--luma-smooth-strength", type=float, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -59,6 +60,8 @@ def main() -> None:
         model.highlight_protect_strength = float(args.highlight_protect_strength)
     if args.chroma_smooth_strength is not None and hasattr(model, "chroma_smooth_strength"):
         model.chroma_smooth_strength = float(args.chroma_smooth_strength)
+    if args.luma_smooth_strength is not None and hasattr(model, "luma_smooth_strength"):
+        model.luma_smooth_strength = float(args.luma_smooth_strength)
     noisy = _mat_array(args.noisy_mat)
     gt = _mat_array(args.gt_mat)
     if noisy.shape != gt.shape:
@@ -98,11 +101,17 @@ def main() -> None:
             "enabled": bool(getattr(model, "chroma_smooth_branch", False)),
             "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
         },
+        "luma_smooth": {
+            "enabled": bool(getattr(model, "luma_smooth_branch", False)),
+            "strength": float(getattr(model, "luma_smooth_strength", 0.0)),
+        },
     }
     text = json.dumps(result, indent=2)
     print(text)
     if args.output_json:
-        Path(args.output_json).write_text(text + "\n", encoding="utf-8")
+        output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(text + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

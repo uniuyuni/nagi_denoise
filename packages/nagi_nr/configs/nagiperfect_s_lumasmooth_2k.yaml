@@ -1,0 +1,98 @@
+# NagiPerfect-S HDR-safe luma+chroma smoothing gate.
+#
+# Purpose:
+#   The X-T5 cat EXR showed that chroma-only smoothing does not visibly reduce
+#   grain enough; flat luma high-frequency noise remains dominant. Continue from
+#   the smoothgate checkpoint, keep the main denoiser frozen, and add a small
+#   one-channel luma smoother gate. The gate is bounded and suppressed on HDR
+#   highlights, so it can learn flat-region luma cleanup without owning global
+#   tone or color.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+  chroma_gate_threshold: 0.010
+  chroma_gate_transition: 0.006
+  chroma_gate_kernel_size: 9
+  chroma_gate_highlight_threshold: 1.0
+  chroma_gate_highlight_transition: 0.2
+  chroma_gate_strength: 1.0
+  chroma_smooth_branch: true
+  chroma_smooth_strength: 0.55
+  chroma_smooth_kernel_size: 9
+  chroma_smooth_gate_bias: -4.0
+  chroma_smooth_gate_scale: 1.0
+  luma_smooth_branch: true
+  luma_smooth_strength: 0.45
+  luma_smooth_kernel_size: 5
+  luma_smooth_gate_bias: -3.5
+  luma_smooth_gate_scale: 1.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.0]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 2000
+  warmup_iters: 80
+  lr: 8.0e-4
+  lr_min: 5.0e-5
+  weight_decay: 0.0
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 6
+  init_checkpoint: runs/nagiperfect_perfect_s_smoothgate_3k/nagiperfect_perfect_s_smoothgate_3k_0001500.pt
+  init_state: state_dict
+  init_strict: false
+  freeze_for_chroma_branch: true
+
+loss:
+  final_weight: 0.018
+  base_weight: 0.0
+  srgb_weight: 0.018
+  srgb_base_weight: 0.0
+  body_srgb_weight: 0.010
+  body_srgb_base_weight: 0.0
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.020
+  flat_chroma_hf_weight: 0.0
+  flat_chroma_damp_weight: 0.0
+  flat_chroma_distill_weight: 4.0
+  flat_chroma_delta_distill_weight: 16.0
+  flat_chroma_distill_strength: 0.55
+  flat_chroma_distill_kernel_size: 9
+  flat_threshold: 0.010
+  flat_transition: 0.006
+  flat_kernel_size: 9
+  linear_weight: 0.0008
+  highlight_luma_weight: 0.12
+  highlight_chroma_weight: 0.08
+  highlight_ratio_weight: 0.04
+  detail_weight: 0.025
+  confidence_l1_weight: 0.0
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

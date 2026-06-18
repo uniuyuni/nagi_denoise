@@ -163,6 +163,11 @@ class NagiPerfect(nn.Module):
         chroma_smooth_kernel_size: int = 9,
         chroma_smooth_gate_bias: float = -4.0,
         chroma_smooth_gate_scale: float = 1.0,
+        luma_smooth_branch: bool = False,
+        luma_smooth_strength: float = 0.4,
+        luma_smooth_kernel_size: int = 5,
+        luma_smooth_gate_bias: float = -4.0,
+        luma_smooth_gate_scale: float = 1.0,
     ):
         super().__init__()
         if img_channels != 3:
@@ -197,6 +202,11 @@ class NagiPerfect(nn.Module):
         self.chroma_smooth_kernel_size = int(chroma_smooth_kernel_size)
         self.chroma_smooth_gate_bias = float(chroma_smooth_gate_bias)
         self.chroma_smooth_gate_scale = float(chroma_smooth_gate_scale)
+        self.luma_smooth_branch = bool(luma_smooth_branch)
+        self.luma_smooth_strength = float(luma_smooth_strength)
+        self.luma_smooth_kernel_size = int(luma_smooth_kernel_size)
+        self.luma_smooth_gate_bias = float(luma_smooth_gate_bias)
+        self.luma_smooth_gate_scale = float(luma_smooth_gate_scale)
         self.size_multiple = 2 ** len(self.enc_blk_nums)
         self.register_buffer("_asinh_norm", torch.tensor(math.asinh(self.asinh_k), dtype=torch.float32))
 
@@ -223,6 +233,7 @@ class NagiPerfect(nn.Module):
         self.confidence_head = nn.Conv2d(channels, 1, 3, padding=1)
         self.chroma_head = self._build_chroma_head(channels) if self.chroma_branch else None
         self.chroma_smooth_head = nn.Conv2d(channels, 1, 3, padding=1) if self.chroma_smooth_branch else None
+        self.luma_smooth_head = nn.Conv2d(channels, 1, 3, padding=1) if self.luma_smooth_branch else None
         self._confidence_bias = float(confidence_bias)
         self._init_weights()
 
@@ -260,6 +271,8 @@ class NagiPerfect(nn.Module):
                 nn.init.zeros_(final_chroma.weight)
         if self.chroma_smooth_head is not None:
             nn.init.zeros_(self.chroma_smooth_head.weight)
+        if self.luma_smooth_head is not None:
+            nn.init.zeros_(self.luma_smooth_head.weight)
         if self.base_head.bias is not None:
             nn.init.zeros_(self.base_head.bias)
         if self.detail_head.bias is not None:
@@ -274,6 +287,8 @@ class NagiPerfect(nn.Module):
                 nn.init.zeros_(final_chroma.bias)
         if self.chroma_smooth_head is not None and self.chroma_smooth_head.bias is not None:
             nn.init.constant_(self.chroma_smooth_head.bias, self.chroma_smooth_gate_bias)
+        if self.luma_smooth_head is not None and self.luma_smooth_head.bias is not None:
+            nn.init.constant_(self.luma_smooth_head.bias, self.luma_smooth_gate_bias)
 
     def compress(self, x: torch.Tensor) -> torch.Tensor:
         return torch.asinh(x * self.asinh_k) / self._asinh_norm
@@ -290,7 +305,10 @@ class NagiPerfect(nn.Module):
         return x, pad_h, pad_w
 
     def _input_flat_chroma_gate(self, x: torch.Tensor) -> torch.Tensor:
-        if not (self.chroma_branch or self.chroma_smooth_branch) or self.chroma_gate_strength <= 0.0:
+        if (
+            not (self.chroma_branch or self.chroma_smooth_branch or self.luma_smooth_branch)
+            or self.chroma_gate_strength <= 0.0
+        ):
             return x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
 
         display = linear_to_srgb(x.clamp_min(0.0))
@@ -333,7 +351,25 @@ class NagiPerfect(nn.Module):
         smooth_chroma = local_lowpass(chroma, self.chroma_smooth_kernel_size)
         blend = gate * min(max(self.chroma_smooth_strength, 0.0), 1.0)
         smoothed_display = y + chroma * (1.0 - blend) + smooth_chroma * blend
-        smoothed_linear = srgb_to_linear(smoothed_display.clamp(0.0, 1.0)).clamp_min(0.0)
+        smoothed_linear = srgb_to_linear(smoothed_display.clamp_min(0.0)).clamp_min(0.0)
+        return smoothed_linear, smoothed_linear - output_nonneg
+
+    def _apply_luma_smoothing(
+        self,
+        output: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.luma_smooth_strength <= 0.0:
+            return output, output.new_zeros(output.shape)
+
+        output_nonneg = output.clamp_min(0.0)
+        display = linear_to_srgb(output_nonneg)
+        y = srgb_luma(display)
+        chroma = display - y
+        smooth_y = local_lowpass(y, self.luma_smooth_kernel_size)
+        blend = gate * min(max(self.luma_smooth_strength, 0.0), 1.0)
+        smoothed_display = y * (1.0 - blend) + smooth_y * blend + chroma
+        smoothed_linear = srgb_to_linear(smoothed_display.clamp_min(0.0)).clamp_min(0.0)
         return smoothed_linear, smoothed_linear - output_nonneg
 
     def forward(self, inp: torch.Tensor, return_aux: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
@@ -366,6 +402,8 @@ class NagiPerfect(nn.Module):
         chroma_gate = None
         chroma_smooth_gate = None
         chroma_smooth_delta = None
+        luma_smooth_gate = None
+        luma_smooth_delta = None
         if self.chroma_head is not None:
             chroma_feat = feat
             if self.chroma_branch_use_input:
@@ -384,6 +422,14 @@ class NagiPerfect(nn.Module):
             )
             chroma_residual = chroma_smooth_delta if chroma_residual is None else chroma_residual + chroma_smooth_delta
             chroma_gate = chroma_smooth_gate if chroma_gate is None else torch.maximum(chroma_gate, chroma_smooth_gate)
+        if self.luma_smooth_head is not None:
+            luma_smooth_raw = self.luma_smooth_head(feat)
+            luma_smooth_gate = torch.sigmoid(luma_smooth_raw * self.luma_smooth_gate_scale)
+            luma_smooth_gate = luma_smooth_gate * self._input_flat_chroma_gate(x)
+            output_pre_guard, luma_smooth_delta = self._apply_luma_smoothing(
+                output_pre_guard,
+                luma_smooth_gate,
+            )
         output, highlight_guard = input_highlight_guard(
             output_pre_guard,
             x,
@@ -417,6 +463,13 @@ class NagiPerfect(nn.Module):
                 {
                     "chroma_smooth_gate": chroma_smooth_gate[..., :h, :w],
                     "chroma_smooth_delta": chroma_smooth_delta[..., :h, :w],
+                }
+            )
+        if luma_smooth_gate is not None and luma_smooth_delta is not None:
+            aux.update(
+                {
+                    "luma_smooth_gate": luma_smooth_gate[..., :h, :w],
+                    "luma_smooth_delta": luma_smooth_delta[..., :h, :w],
                 }
             )
         return aux

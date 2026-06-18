@@ -66,6 +66,11 @@ def build_model(cfg: dict) -> NagiPerfect:
                 "chroma_smooth_kernel_size": model.chroma_smooth_kernel_size,
                 "chroma_smooth_gate_bias": model.chroma_smooth_gate_bias,
                 "chroma_smooth_gate_scale": model.chroma_smooth_gate_scale,
+                "luma_smooth_branch": model.luma_smooth_branch,
+                "luma_smooth_strength": model.luma_smooth_strength,
+                "luma_smooth_kernel_size": model.luma_smooth_kernel_size,
+                "luma_smooth_gate_bias": model.luma_smooth_gate_bias,
+                "luma_smooth_gate_scale": model.luma_smooth_gate_scale,
             }
             merged.update(model_cfg)
             model = NagiPerfect(**merged)
@@ -270,10 +275,18 @@ def main() -> None:
                 print(f"unexpected keys: {model_result.unexpected_keys}")
 
     if bool(train_cfg.get("freeze_for_chroma_branch", False)):
-        if getattr(model, "chroma_head", None) is None and getattr(model, "chroma_smooth_head", None) is None:
+        if (
+            getattr(model, "chroma_head", None) is None
+            and getattr(model, "chroma_smooth_head", None) is None
+            and getattr(model, "luma_smooth_head", None) is None
+        ):
             raise ValueError("freeze_for_chroma_branch requires a chroma branch")
         for name, param in model.named_parameters():
-            param.requires_grad_(name.startswith("chroma_head.") or name.startswith("chroma_smooth_head."))
+            param.requires_grad_(
+                name.startswith("chroma_head.")
+                or name.startswith("chroma_smooth_head.")
+                or name.startswith("luma_smooth_head.")
+            )
         for name, param in ema.named_parameters():
             param.requires_grad_(False)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
