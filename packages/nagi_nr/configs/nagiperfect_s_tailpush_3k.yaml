@@ -1,0 +1,77 @@
+# NagiPerfect-S tail-push continuation.
+#
+# Purpose:
+#   The Guard/LumaGuard line reduced average flat noise but left the visible
+#   p99 tail. Continue from strictflat_5k and directly penalize the worst flat
+#   luma high-frequency residuals instead of only optimizing their mean.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.70, 1.6]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.16
+  gauss_sigma_max: 30.0
+  poisson_lambda_range: [22.0, 150.0]
+  jpeg_q_range: [92, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 3000
+  warmup_iters: 120
+  lr: 7.0e-7
+  lr_min: 1.0e-7
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 8
+  init_checkpoint: runs/nagiperfect_perfect_s_strictflat_5k/nagiperfect_perfect_s_strictflat_5k_final.pt
+  init_state: state_dict
+
+loss:
+  final_weight: 0.46
+  base_weight: 0.14
+  srgb_weight: 0.55
+  srgb_base_weight: 0.14
+  body_srgb_weight: 0.24
+  body_srgb_base_weight: 0.05
+  flat_srgb_hf_weight: 0.34
+  flat_luma_hf_weight: 0.10
+  flat_luma_tail_weight: 0.42
+  flat_luma_tail_fraction: 0.018
+  flat_chroma_hf_weight: 0.08
+  flat_threshold: 0.012
+  flat_transition: 0.004
+  flat_kernel_size: 9
+  edge_luma_hf_weight: 0.11
+  edge_threshold: 0.040
+  edge_transition: 0.015
+  linear_weight: 0.025
+  highlight_luma_weight: 0.14
+  highlight_chroma_weight: 0.07
+  highlight_ratio_weight: 0.06
+  detail_weight: 0.13
+  confidence_l1_weight: 0.0004
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

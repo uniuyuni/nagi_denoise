@@ -247,6 +247,8 @@ class NagiPerfectLoss(nn.Module):
         body_srgb_base_weight: float = 0.0,
         flat_srgb_hf_weight: float = 0.0,
         flat_luma_hf_weight: float = 0.0,
+        flat_luma_tail_weight: float = 0.0,
+        flat_luma_tail_fraction: float = 0.02,
         flat_chroma_hf_weight: float = 0.0,
         flat_chroma_damp_weight: float = 0.0,
         flat_chroma_distill_weight: float = 0.0,
@@ -287,6 +289,8 @@ class NagiPerfectLoss(nn.Module):
         self.body_srgb_base_weight = float(body_srgb_base_weight)
         self.flat_srgb_hf_weight = float(flat_srgb_hf_weight)
         self.flat_luma_hf_weight = float(flat_luma_hf_weight)
+        self.flat_luma_tail_weight = float(flat_luma_tail_weight)
+        self.flat_luma_tail_fraction = float(flat_luma_tail_fraction)
         self.flat_chroma_hf_weight = float(flat_chroma_hf_weight)
         self.flat_chroma_damp_weight = float(flat_chroma_damp_weight)
         self.flat_chroma_distill_weight = float(flat_chroma_distill_weight)
@@ -438,21 +442,29 @@ class NagiPerfectLoss(nn.Module):
             out["flat_srgb_hf"] = loss_flat_hf.detach()
             out["flat_mask_mean"] = flat_mask.mean().detach()
 
-        if self.flat_luma_hf_weight > 0 or self.flat_chroma_hf_weight > 0:
+        if self.flat_luma_hf_weight > 0 or self.flat_luma_tail_weight > 0 or self.flat_chroma_hf_weight > 0:
             target_srgb = linear_to_srgb(target)
             output_srgb = linear_to_srgb(output)
             flat_mask = self._flat_mask(target_srgb, body_mask)
             flat_mask_mean = flat_mask.mean().clamp_min(1.0e-6)
             target_y = self._srgb_luma(target_srgb)
             output_y = self._srgb_luma(output_srgb)
+            residual_y = output_y - target_y
+            residual_y_hf = residual_y - _local_lowpass(residual_y, self.flat_kernel_size)
 
             if self.flat_luma_hf_weight > 0:
-                residual_y = output_y - target_y
-                residual_y_hf = residual_y - _local_lowpass(residual_y, self.flat_kernel_size)
                 loss_flat_luma = (torch.sqrt(residual_y_hf.pow(2) + self.charb.eps2) * flat_mask).sum()
                 loss_flat_luma = loss_flat_luma / (flat_mask_mean * flat_mask.numel())
                 total = total + self.flat_luma_hf_weight * loss_flat_luma
                 out["flat_luma_hf"] = loss_flat_luma.detach()
+
+            if self.flat_luma_tail_weight > 0:
+                tail = torch.sqrt(residual_y_hf.pow(2) + self.charb.eps2) * flat_mask
+                tail = tail.flatten(1)
+                k = max(1, int(tail.shape[1] * max(min(self.flat_luma_tail_fraction, 1.0), 1.0e-6)))
+                loss_tail = tail.topk(k, dim=1, largest=True).values.mean()
+                total = total + self.flat_luma_tail_weight * loss_tail
+                out["flat_luma_tail"] = loss_tail.detach()
 
             if self.flat_chroma_hf_weight > 0:
                 output_chroma = output_srgb - output_y
