@@ -145,6 +145,69 @@ def adaptive_luma_gate(
     return (flat * non_edge * (1.0 - highlight)).clamp(0.0, 1.0)
 
 
+def paired_luma_noise_gate(
+    noisy_linear: torch.Tensor,
+    clean_linear: torch.Tensor,
+    *,
+    structure_kernel_size: int = 9,
+    detail_kernel_size: int = 13,
+    noise_kernel_size: int = 5,
+    noise_threshold: float = 0.006,
+    noise_transition: float = 0.005,
+    clean_detail_threshold: float = 0.010,
+    clean_detail_transition: float = 0.006,
+    edge_threshold: float = 0.018,
+    edge_transition: float = 0.010,
+    highlight_threshold: float = 1.0,
+    highlight_transition: float = 0.25,
+) -> torch.Tensor:
+    """Paired teacher gate for visible luma noise.
+
+    Unlike the heuristic luma teacher, this uses the clean target to separate
+    true texture from noisy luma variation. The gate is high where noisy-clean
+    residual is visible, while clean-side detail/edges/highlights suppress it.
+    """
+
+    noisy = noisy_linear.clamp_min(0.0)
+    clean = clean_linear.clamp_min(0.0)
+    noisy_display = linear_to_srgb(noisy).clamp(0.0, 1.0)
+    clean_display = linear_to_srgb(clean).clamp(0.0, 1.0)
+    noisy_y = srgb_luma(noisy_display)
+    clean_y = srgb_luma(clean_display)
+
+    residual = noisy_y - clean_y
+    residual_hf = residual - local_lowpass(residual, int(noise_kernel_size))
+    visible_noise = torch.maximum(residual.abs(), residual_hf.abs())
+    noise = torch.sigmoid(
+        (visible_noise - float(noise_threshold)) / max(float(noise_transition), 1.0e-6)
+    )
+
+    clean_structure = local_lowpass(clean_y, int(structure_kernel_size))
+    clean_detail = (clean_structure - local_lowpass(clean_structure, int(detail_kernel_size))).abs()
+    flat = torch.sigmoid(
+        (float(clean_detail_threshold) - clean_detail) / max(float(clean_detail_transition), 1.0e-6)
+    )
+
+    dx = F.pad(
+        clean_structure[:, :, :, 1:] - clean_structure[:, :, :, :-1],
+        (0, 1, 0, 0),
+        mode="replicate",
+    )
+    dy = F.pad(
+        clean_structure[:, :, 1:, :] - clean_structure[:, :, :-1, :],
+        (0, 0, 0, 1),
+        mode="replicate",
+    )
+    edge = torch.sqrt(dx.pow(2) + dy.pow(2) + 1.0e-12)
+    non_edge = torch.sigmoid((float(edge_threshold) - edge) / max(float(edge_transition), 1.0e-6))
+
+    clean_y_linear = linear_luma(clean)
+    highlight = torch.sigmoid(
+        (clean_y_linear - float(highlight_threshold)) / max(float(highlight_transition), 1.0e-6)
+    )
+    return (noise * flat * non_edge * (1.0 - highlight)).clamp(0.0, 1.0)
+
+
 class ChromaGuardBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()

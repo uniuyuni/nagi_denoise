@@ -13,7 +13,13 @@ import yaml
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from .chromaguard import ChromaGuard, adaptive_chroma_gate, adaptive_luma_gate, heuristic_chroma_gate
+from .chromaguard import (
+    ChromaGuard,
+    adaptive_chroma_gate,
+    adaptive_luma_gate,
+    heuristic_chroma_gate,
+    paired_luma_noise_gate,
+)
 from .data import ChunkedShuffleSampler, SIDDPatchDataset, find_polyu_pairs, find_sidd_pairs
 from .devices import resolve_device
 
@@ -176,11 +182,15 @@ def main() -> None:
             data_iter = iter(dl)
             noisy, _clean = next(data_iter)
         noisy = noisy.to(device, non_blocking=True)
+        if teacher_kind == "paired_luma":
+            _clean = _clean.to(device, non_blocking=True)
         with torch.no_grad():
             if teacher_kind == "adaptive":
                 target = adaptive_chroma_gate(noisy, **teacher_cfg)
             elif teacher_kind == "luma":
                 target = adaptive_luma_gate(noisy, **teacher_cfg)
+            elif teacher_kind == "paired_luma":
+                target = paired_luma_noise_gate(noisy, _clean, **teacher_cfg)
             elif teacher_kind == "fixed":
                 target = heuristic_chroma_gate(noisy, **teacher_cfg)
             else:
