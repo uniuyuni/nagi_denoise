@@ -9,11 +9,13 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "nagi_nr" / "src"))
 
 from nagi_nr.chromaguard import ChromaGuard
-from apply_guided_luma_smoother import apply_guided_luma_smoothing
+from apply_flat_chroma_smoother import LUMA_LINEAR, LUMA_SRGB, linear_to_srgb_np, luma, smoothstep, srgb_to_linear_np
+from apply_guided_luma_smoother import guided_filter_gray, make_luma_gate
 from denoise_exr_chromaguard import predict_gate
 from perfect_nr_detail_guard import write_exr, write_tiff
 from perfect_nr_probe import image_stats, make_preview, read_image
@@ -52,6 +54,8 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=512)
     parser.add_argument("--tile-overlap", type=int, default=64)
+    parser.add_argument("--no-safety-gate", action="store_true")
+    parser.add_argument("--safety-gate-gain", type=float, default=1.15)
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser()
@@ -82,51 +86,48 @@ def main() -> None:
     gate = predict_gate(model, guide, device=device, tile_size=int(args.tile_size), overlap=int(args.tile_overlap))
     gate = np.clip(gate * preset["gate_gain"] + preset["gate_bias"], 0.0, 1.0).astype(np.float32, copy=False)
 
-    out, stats, _heuristic_gate = apply_guided_luma_smoothing(
-        image,
-        guide,
-        strength=float(preset["strength"]),
-        radius=int(preset["radius"]),
-        eps=float(preset["eps"]),
-        guide_sigma=1.0,
-        structure_sigma=1.2,
-        detail_sigma=2.6,
-        detail_threshold=1.0,
-        detail_transition=1.0,
-        edge_sigma=1.0,
-        edge_threshold=1.0,
-        edge_transition=1.0,
-        highlight_threshold=1.0,
-        highlight_transition=0.25,
-        hdr_restore_peak_threshold=0.95,
-        hdr_restore_threshold=0.85,
-        hdr_restore_transition=0.25,
-    )
-
-    # Re-apply the same guided smoothing internals with the learned gate by
-    # blending between the ungated input and the fully-smoothed candidate.
-    full, _stats_full, _ = apply_guided_luma_smoothing(
-        image,
-        guide,
-        strength=1.0,
-        radius=int(preset["radius"]),
-        eps=float(preset["eps"]),
-        guide_sigma=1.0,
-        structure_sigma=1.2,
-        detail_sigma=2.6,
-        detail_threshold=1.0,
-        detail_transition=1.0,
-        edge_sigma=1.0,
-        edge_threshold=1.0,
-        edge_transition=1.0,
-        highlight_threshold=1.0,
-        highlight_transition=0.25,
-        hdr_restore_peak_threshold=0.95,
-        hdr_restore_threshold=0.85,
-        hdr_restore_transition=0.25,
-    )
+    base = np.nan_to_num(image[..., :3].astype(np.float32, copy=False), nan=0.0, posinf=1.0, neginf=0.0)
+    guide_base = np.nan_to_num(guide[..., :3].astype(np.float32, copy=False), nan=0.0, posinf=1.0, neginf=0.0)
+    display = np.clip(linear_to_srgb_np(base), 0.0, 1.0)
+    guide_display = np.clip(linear_to_srgb_np(guide_base), 0.0, 1.0)
+    y = luma(display, LUMA_SRGB)
+    guide_y = luma(guide_display, LUMA_SRGB)
+    guide_y_linear = luma(np.clip(guide_base, 0.0, None), LUMA_LINEAR)
+    if not args.no_safety_gate:
+        safety_gate = make_luma_gate(
+            guide_y,
+            guide_y_linear,
+            structure_sigma=1.2,
+            detail_sigma=2.6,
+            detail_threshold=0.010,
+            detail_transition=0.006,
+            edge_sigma=1.0,
+            edge_threshold=0.018,
+            edge_transition=0.010,
+            highlight_threshold=1.0,
+            highlight_transition=0.25,
+        )
+        gate = np.minimum(gate, np.clip(safety_gate * float(args.safety_gate_gain), 0.0, 1.0))
+    structure = gaussian_filter(guide_y, sigma=1.0, mode="reflect")
+    y_smooth = guided_filter_gray(structure, y, radius=int(preset["radius"]), eps=float(preset["eps"]))
     blend = np.clip(gate * float(preset["strength"]), 0.0, 1.0)[..., None]
-    out = image[..., :3].astype(np.float32, copy=False) * (1.0 - blend) + full * blend
+    out_y = y * (1.0 - blend[..., 0]) + y_smooth * blend[..., 0]
+    chroma = display / np.maximum(y[..., None], 1.0e-6)
+    out_display = np.clip(chroma * np.maximum(out_y[..., None], 0.0), 0.0, 1.0)
+    out = srgb_to_linear_np(out_display)
+
+    y_linear = luma(base, LUMA_LINEAR)
+    peak_linear = np.max(base, axis=2)
+    hdr_signal = np.maximum(y_linear - 0.85, peak_linear - 0.95)
+    hdr_restore = smoothstep(hdr_signal / 0.25)
+    out = out * (1.0 - hdr_restore[..., None]) + base * hdr_restore[..., None]
+    stats = {
+        "strength": float(preset["strength"]),
+        "radius": int(preset["radius"]),
+        "eps": float(preset["eps"]),
+        "hdr_restore_mean": float(np.mean(hdr_restore)),
+        "hdr_restore_p99": float(np.quantile(hdr_restore, 0.99)),
+    }
 
     exr_path = out_dir / f"{name}.exr"
     tiff_path = out_dir / f"{name}.tiff"
@@ -143,6 +144,10 @@ def main() -> None:
         "weights": str(weights),
         "outputs": {"exr": str(exr_path), "tiff": str(tiff_path), "preview": str(preview_path), "gate": str(gate_path)},
         "params": {"preset": args.preset, **preset},
+        "safety_gate": {
+            "enabled": not args.no_safety_gate,
+            "gain": float(args.safety_gate_gain),
+        },
         "gate": {
             "mean": float(np.mean(gate)),
             "p50": float(np.quantile(gate, 0.50)),
