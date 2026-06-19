@@ -107,6 +107,44 @@ def adaptive_chroma_gate(
     return (gate * (1.0 - highlight)).clamp(0.0, 1.0)
 
 
+def adaptive_luma_gate(
+    x_linear: torch.Tensor,
+    *,
+    structure_kernel_size: int = 9,
+    detail_kernel_size: int = 19,
+    detail_threshold: float = 0.010,
+    detail_transition: float = 0.006,
+    edge_threshold: float = 0.018,
+    edge_transition: float = 0.010,
+    highlight_threshold: float = 1.0,
+    highlight_transition: float = 0.25,
+) -> torch.Tensor:
+    """Teacher gate for guided luma NR.
+
+    This mirrors the practical ``luma_flat_strong`` diagnostic: allow luma
+    smoothing in flat noisy areas, but back off around coherent edges, hairs,
+    eyes, whiskers, and true highlights.
+    """
+
+    x = x_linear.clamp_min(0.0)
+    display = linear_to_srgb(x).clamp(0.0, 1.0)
+    y = srgb_luma(display)
+    structure = local_lowpass(y, int(structure_kernel_size))
+    detail = (structure - local_lowpass(structure, int(detail_kernel_size))).abs()
+
+    dx = F.pad(structure[:, :, :, 1:] - structure[:, :, :, :-1], (0, 1, 0, 0), mode="replicate")
+    dy = F.pad(structure[:, :, 1:, :] - structure[:, :, :-1, :], (0, 0, 0, 1), mode="replicate")
+    edge = torch.sqrt(dx.pow(2) + dy.pow(2) + 1.0e-12)
+
+    flat = torch.sigmoid((float(detail_threshold) - detail) / max(float(detail_transition), 1.0e-6))
+    non_edge = torch.sigmoid((float(edge_threshold) - edge) / max(float(edge_transition), 1.0e-6))
+    y_linear = linear_luma(x)
+    highlight = torch.sigmoid(
+        (y_linear - float(highlight_threshold)) / max(float(highlight_transition), 1.0e-6)
+    )
+    return (flat * non_edge * (1.0 - highlight)).clamp(0.0, 1.0)
+
+
 class ChromaGuardBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
