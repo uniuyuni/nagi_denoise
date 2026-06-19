@@ -35,7 +35,12 @@ def latest_checkpoint(out_dir: Path, prefix: str) -> Path | None:
             best_path = Path(name)
     final = out_dir / f"{prefix}_final.pt"
     if final.exists():
-        return final
+        try:
+            final_step = int(torch.load(final, map_location="cpu", weights_only=False).get("step", -1))
+        except Exception:
+            final_step = -1
+        if final_step >= best_step:
+            return final
     return best_path
 
 
@@ -165,7 +170,11 @@ def main() -> None:
         for group in opt.param_groups:
             group["lr"] = cur_lr
         opt.zero_grad(set_to_none=True)
-        noisy, _clean = next(data_iter)
+        try:
+            noisy, _clean = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dl)
+            noisy, _clean = next(data_iter)
         noisy = noisy.to(device, non_blocking=True)
         with torch.no_grad():
             if teacher_kind == "adaptive":
