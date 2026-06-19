@@ -26,6 +26,7 @@ PRESETS = {
         "shrink_threshold": 0.0045,
         "detail_preserve_threshold": 0.020,
         "detail_preserve_transition": 0.010,
+        "shadow_boost": 0.0,
     },
     "strong": {
         "strength": 0.68,
@@ -33,6 +34,7 @@ PRESETS = {
         "shrink_threshold": 0.0060,
         "detail_preserve_threshold": 0.024,
         "detail_preserve_transition": 0.011,
+        "shadow_boost": 0.0,
     },
     "xstrong": {
         "strength": 0.85,
@@ -40,6 +42,7 @@ PRESETS = {
         "shrink_threshold": 0.0075,
         "detail_preserve_threshold": 0.028,
         "detail_preserve_transition": 0.012,
+        "shadow_boost": 0.0,
     },
     "ultra": {
         "strength": 1.0,
@@ -47,6 +50,15 @@ PRESETS = {
         "shrink_threshold": 0.0120,
         "detail_preserve_threshold": 0.040,
         "detail_preserve_transition": 0.016,
+        "shadow_boost": 0.0,
+    },
+    "shadow": {
+        "strength": 1.0,
+        "low_sigma": 1.40,
+        "shrink_threshold": 0.0128,
+        "detail_preserve_threshold": 0.043,
+        "detail_preserve_transition": 0.018,
+        "shadow_boost": 0.70,
     },
 }
 
@@ -109,6 +121,9 @@ def apply_luma_hf_shrink(
     shrink_threshold: float,
     detail_preserve_threshold: float,
     detail_preserve_transition: float,
+    shadow_boost: float,
+    shadow_threshold: float,
+    shadow_transition: float,
     structure_sigma: float,
     detail_sigma: float,
     detail_threshold: float,
@@ -144,8 +159,9 @@ def apply_luma_hf_shrink(
     detail_preserve = sigmoid01(
         (high_abs - float(detail_preserve_threshold)) / max(float(detail_preserve_transition), 1.0e-6)
     )
+    shadow_gate = sigmoid01((float(shadow_threshold) - y_low) / max(float(shadow_transition), 1.0e-6))
     shrink_gate = np.clip(flat_gate * (1.0 - detail_preserve) * float(strength), 0.0, 1.0)
-    amount = shrink_gate * float(shrink_threshold)
+    amount = shrink_gate * float(shrink_threshold) * (1.0 + float(shadow_boost) * shadow_gate)
     high_new = soft_shrink_highpass(high, amount=amount)
     out_y = np.clip(y_low + high_new, 0.0, 1.0)
 
@@ -169,6 +185,12 @@ def apply_luma_hf_shrink(
         "shrink_threshold": float(shrink_threshold),
         "detail_preserve_threshold": float(detail_preserve_threshold),
         "detail_preserve_transition": float(detail_preserve_transition),
+        "shadow_boost": float(shadow_boost),
+        "shadow_threshold": float(shadow_threshold),
+        "shadow_transition": float(shadow_transition),
+        "shadow_gate_mean": float(np.mean(shadow_gate)),
+        "shadow_gate_p90": float(np.quantile(shadow_gate, 0.90)),
+        "shadow_gate_p99": float(np.quantile(shadow_gate, 0.99)),
         "shrink_gate_mean": float(np.mean(shrink_gate)),
         "shrink_gate_p90": float(np.quantile(shrink_gate, 0.90)),
         "shrink_gate_p99": float(np.quantile(shrink_gate, 0.99)),
@@ -194,6 +216,9 @@ def main() -> None:
     parser.add_argument("--shrink-threshold", type=float, default=None)
     parser.add_argument("--detail-preserve-threshold", type=float, default=None)
     parser.add_argument("--detail-preserve-transition", type=float, default=None)
+    parser.add_argument("--shadow-boost", type=float, default=None)
+    parser.add_argument("--shadow-threshold", type=float, default=0.18)
+    parser.add_argument("--shadow-transition", type=float, default=0.08)
     parser.add_argument("--structure-sigma", type=float, default=1.2)
     parser.add_argument("--detail-sigma", type=float, default=2.8)
     parser.add_argument("--detail-threshold", type=float, default=0.018)
@@ -215,6 +240,7 @@ def main() -> None:
         ("shrink_threshold", "shrink_threshold"),
         ("detail_preserve_threshold", "detail_preserve_threshold"),
         ("detail_preserve_transition", "detail_preserve_transition"),
+        ("shadow_boost", "shadow_boost"),
     ):
         value = getattr(args, attr)
         if value is not None:
@@ -239,6 +265,9 @@ def main() -> None:
         shrink_threshold=float(params["shrink_threshold"]),
         detail_preserve_threshold=float(params["detail_preserve_threshold"]),
         detail_preserve_transition=float(params["detail_preserve_transition"]),
+        shadow_boost=float(params["shadow_boost"]),
+        shadow_threshold=args.shadow_threshold,
+        shadow_transition=args.shadow_transition,
         structure_sigma=args.structure_sigma,
         detail_sigma=args.detail_sigma,
         detail_threshold=args.detail_threshold,
