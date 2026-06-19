@@ -19,6 +19,28 @@ from perfect_nr_detail_guard import write_exr, write_tiff
 from perfect_nr_probe import image_stats, make_preview, read_image
 
 
+PRESETS = {
+    "conservative": {
+        "gate_gain": 1.35,
+        "gate_bias": 0.0,
+        "strength": 1.0,
+        "chroma_sigma": 2.0,
+    },
+    "balanced": {
+        "gate_gain": 1.45,
+        "gate_bias": 0.0,
+        "strength": 1.0,
+        "chroma_sigma": 2.0,
+    },
+    "strong": {
+        "gate_gain": 1.55,
+        "gate_bias": 0.0,
+        "strength": 1.0,
+        "chroma_sigma": 2.0,
+    },
+}
+
+
 def load_guard(weights: Path, device: torch.device) -> ChromaGuard:
     ckpt = torch.load(weights, map_location="cpu", weights_only=False)
     model_cfg = dict((ckpt.get("config") or {}).get("model") or {})
@@ -115,10 +137,11 @@ def main() -> None:
     parser.add_argument("--output-dir", default="runs/perfect_nr/chromaguard")
     parser.add_argument("--name", default=None)
     parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
-    parser.add_argument("--strength", type=float, default=1.0)
-    parser.add_argument("--chroma-sigma", type=float, default=2.0)
-    parser.add_argument("--gate-gain", type=float, default=1.0)
-    parser.add_argument("--gate-bias", type=float, default=0.0)
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="balanced")
+    parser.add_argument("--strength", type=float, default=None)
+    parser.add_argument("--chroma-sigma", type=float, default=None)
+    parser.add_argument("--gate-gain", type=float, default=None)
+    parser.add_argument("--gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=512)
     parser.add_argument("--tile-overlap", type=int, default=64)
     parser.add_argument("--hdr-restore-peak-threshold", type=float, default=0.95)
@@ -134,16 +157,25 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     name = args.name or f"{input_path.stem.replace(' ', '_')}_chromaguard"
     device = torch.device(args.device)
+    preset = dict(PRESETS[args.preset])
+    if args.strength is not None:
+        preset["strength"] = float(args.strength)
+    if args.chroma_sigma is not None:
+        preset["chroma_sigma"] = float(args.chroma_sigma)
+    if args.gate_gain is not None:
+        preset["gate_gain"] = float(args.gate_gain)
+    if args.gate_bias is not None:
+        preset["gate_bias"] = float(args.gate_bias)
 
     image = read_image(input_path)
     model = load_guard(weights, device=device)
     gate = predict_gate(model, image, device=device, tile_size=int(args.tile_size), overlap=int(args.tile_overlap))
-    gate = np.clip(gate * float(args.gate_gain) + float(args.gate_bias), 0.0, 1.0).astype(np.float32, copy=False)
+    gate = np.clip(gate * preset["gate_gain"] + preset["gate_bias"], 0.0, 1.0).astype(np.float32, copy=False)
     output = apply_chroma_nr_with_gate(
         image,
         gate,
-        strength=float(args.strength),
-        chroma_sigma=float(args.chroma_sigma),
+        strength=preset["strength"],
+        chroma_sigma=preset["chroma_sigma"],
         hdr_restore_peak_threshold=float(args.hdr_restore_peak_threshold),
         hdr_restore_threshold=float(args.hdr_restore_threshold),
         hdr_restore_transition=float(args.hdr_restore_transition),
@@ -164,10 +196,11 @@ def main() -> None:
         "weights": str(weights),
         "outputs": {"exr": str(exr_path), "tiff": str(tiff_path), "preview": str(preview_path), "gate": str(gate_path)},
         "params": {
-            "strength": float(args.strength),
-            "chroma_sigma": float(args.chroma_sigma),
-            "gate_gain": float(args.gate_gain),
-            "gate_bias": float(args.gate_bias),
+            "preset": args.preset,
+            "strength": preset["strength"],
+            "chroma_sigma": preset["chroma_sigma"],
+            "gate_gain": preset["gate_gain"],
+            "gate_bias": preset["gate_bias"],
         },
         "gate": {
             "mean": float(np.mean(gate)),
