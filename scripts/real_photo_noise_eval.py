@@ -121,6 +121,12 @@ def mean_masked(a: np.ndarray, mask: np.ndarray) -> float:
     return float(np.mean(a[mask]))
 
 
+def quantile_masked(a: np.ndarray, mask: np.ndarray, q: float) -> float:
+    if not np.any(mask):
+        return 0.0
+    return float(np.quantile(a[mask], float(q)))
+
+
 def safe_ratio(value: float, base: float) -> float:
     return float(value / max(base, 1.0e-8))
 
@@ -142,6 +148,8 @@ def candidate_metrics(
     out_luma_hf = luma_hf_energy(candidate_display, hf_sigma)
     ref_chroma_hf = chroma_hf_energy(reference_display, hf_sigma)
     out_chroma_hf = chroma_hf_energy(candidate_display, hf_sigma)
+    y_display = luma(reference_display, LUMA_SRGB)
+    visibility_weight = 1.0 / np.sqrt(np.maximum(y_display, 0.02))
 
     ref_edge_hf = ref_luma_hf
     out_edge_hf = out_luma_hf
@@ -155,6 +163,18 @@ def candidate_metrics(
     flat_chroma = mean_masked(out_chroma_hf, flat)
     ref_flat_luma = mean_masked(ref_luma_hf, flat)
     ref_flat_chroma = mean_masked(ref_chroma_hf, flat)
+    flat_luma_p95 = quantile_masked(out_luma_hf, flat, 0.95)
+    flat_luma_p99 = quantile_masked(out_luma_hf, flat, 0.99)
+    flat_chroma_p95 = quantile_masked(out_chroma_hf, flat, 0.95)
+    flat_chroma_p99 = quantile_masked(out_chroma_hf, flat, 0.99)
+    ref_flat_luma_p95 = quantile_masked(ref_luma_hf, flat, 0.95)
+    ref_flat_luma_p99 = quantile_masked(ref_luma_hf, flat, 0.99)
+    ref_flat_chroma_p95 = quantile_masked(ref_chroma_hf, flat, 0.95)
+    ref_flat_chroma_p99 = quantile_masked(ref_chroma_hf, flat, 0.99)
+    flat_luma_visible = mean_masked(out_luma_hf * visibility_weight, flat)
+    flat_chroma_visible = mean_masked(out_chroma_hf * visibility_weight, flat)
+    ref_flat_luma_visible = mean_masked(ref_luma_hf * visibility_weight, flat)
+    ref_flat_chroma_visible = mean_masked(ref_chroma_hf * visibility_weight, flat)
     edge_hf = mean_masked(out_edge_hf, edge)
     ref_edge = mean_masked(ref_edge_hf, edge)
 
@@ -168,10 +188,24 @@ def candidate_metrics(
         "reference_flat_luma_hf": ref_flat_luma,
         "flat_luma_hf_ratio": safe_ratio(flat_luma, ref_flat_luma),
         "flat_luma_hf_reduction": 1.0 - safe_ratio(flat_luma, ref_flat_luma),
+        "flat_luma_hf_p95": flat_luma_p95,
+        "reference_flat_luma_hf_p95": ref_flat_luma_p95,
+        "flat_luma_hf_p95_ratio": safe_ratio(flat_luma_p95, ref_flat_luma_p95),
+        "flat_luma_hf_p99": flat_luma_p99,
+        "reference_flat_luma_hf_p99": ref_flat_luma_p99,
+        "flat_luma_hf_p99_ratio": safe_ratio(flat_luma_p99, ref_flat_luma_p99),
+        "flat_luma_visible_ratio": safe_ratio(flat_luma_visible, ref_flat_luma_visible),
         "flat_chroma_hf": flat_chroma,
         "reference_flat_chroma_hf": ref_flat_chroma,
         "flat_chroma_hf_ratio": safe_ratio(flat_chroma, ref_flat_chroma),
         "flat_chroma_hf_reduction": 1.0 - safe_ratio(flat_chroma, ref_flat_chroma),
+        "flat_chroma_hf_p95": flat_chroma_p95,
+        "reference_flat_chroma_hf_p95": ref_flat_chroma_p95,
+        "flat_chroma_hf_p95_ratio": safe_ratio(flat_chroma_p95, ref_flat_chroma_p95),
+        "flat_chroma_hf_p99": flat_chroma_p99,
+        "reference_flat_chroma_hf_p99": ref_flat_chroma_p99,
+        "flat_chroma_hf_p99_ratio": safe_ratio(flat_chroma_p99, ref_flat_chroma_p99),
+        "flat_chroma_visible_ratio": safe_ratio(flat_chroma_visible, ref_flat_chroma_visible),
         "edge_luma_hf": edge_hf,
         "reference_edge_luma_hf": ref_edge,
         "edge_luma_hf_retention": safe_ratio(edge_hf, ref_edge),
@@ -344,6 +378,26 @@ def main() -> None:
                 hl=m["highlight_luma_delta"],
                 rgb=m["rgb_max"],
                 preview=item["preview"],
+            )
+        )
+    lines += [
+        "",
+        "Tail / visibility metrics:",
+        "",
+        "| candidate | luma p95 ratio | luma p99 ratio | luma visible ratio | chroma p95 ratio | chroma p99 ratio | chroma visible ratio |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for item in report["candidates"]:
+        m = item["metrics"]
+        lines.append(
+            "| {name} | {lp95:.3f} | {lp99:.3f} | {lv:.3f} | {cp95:.3f} | {cp99:.3f} | {cv:.3f} |".format(
+                name=item["name"],
+                lp95=m["flat_luma_hf_p95_ratio"],
+                lp99=m["flat_luma_hf_p99_ratio"],
+                lv=m["flat_luma_visible_ratio"],
+                cp95=m["flat_chroma_hf_p95_ratio"],
+                cp99=m["flat_chroma_hf_p99_ratio"],
+                cv=m["flat_chroma_visible_ratio"],
             )
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
