@@ -18,6 +18,13 @@ from perfect_nr_probe import image_stats, make_preview, read_image
 from perfect_nr_detail_guard import write_exr, write_tiff
 
 
+POST_CHROMA_OVERSHRINK_PRESETS = {
+    "off": 1.0,
+    "balanced": 1.6,
+    "quality": 2.0,
+}
+
+
 def linear_to_srgb_hdr(image: np.ndarray) -> np.ndarray:
     x = np.asarray(image, dtype=np.float32)
     is_low = x <= 0.0031308
@@ -289,7 +296,18 @@ def main() -> None:
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-gate-bias", type=float, default=None)
-    parser.add_argument("--post-chroma-overshrink-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--post-chroma-overshrink-preset",
+        choices=sorted(POST_CHROMA_OVERSHRINK_PRESETS),
+        default="off",
+        help="Post chroma cleanup preset. 'quality' is the current best real-photo setting.",
+    )
+    parser.add_argument(
+        "--post-chroma-overshrink-strength",
+        type=float,
+        default=None,
+        help="Override the post chroma cleanup strength. Values above 1.0 enable cleanup.",
+    )
     parser.add_argument("--post-chroma-overshrink-kernel-size", type=int, default=9)
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
@@ -324,7 +342,11 @@ def main() -> None:
     if args.luma_smooth_gate_bias is not None and getattr(model, "luma_smooth_head", None) is not None:
         with torch.no_grad():
             model.luma_smooth_head.bias.fill_(float(args.luma_smooth_gate_bias))
-    post_chroma_overshrink_strength = float(args.post_chroma_overshrink_strength)
+    post_chroma_overshrink_strength = float(
+        args.post_chroma_overshrink_strength
+        if args.post_chroma_overshrink_strength is not None
+        else POST_CHROMA_OVERSHRINK_PRESETS[args.post_chroma_overshrink_preset]
+    )
     need_diagnostics = (not bool(args.fast)) or post_chroma_overshrink_strength > 1.0
     output, extras = run_tiled_image(
         model,
@@ -397,6 +419,7 @@ def main() -> None:
             "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
             "kernel_size": int(getattr(model, "chroma_smooth_kernel_size", 0)),
             "gate_bias_override": args.chroma_smooth_gate_bias,
+            "post_overshrink_preset": args.post_chroma_overshrink_preset,
             "post_overshrink_strength": post_chroma_overshrink_strength,
             "post_overshrink_kernel_size": int(args.post_chroma_overshrink_kernel_size),
         },

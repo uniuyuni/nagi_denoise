@@ -1472,3 +1472,56 @@ non-finite training event. If revisited, lower LR substantially and add loss
 guards around the gate/sRGB conversion path. Current practical best remains
 `smoothgate_1500` with `--chroma-smooth-strength 0.55`, with `smoothgate_1000`
 as the conservative fallback.
+
+### Chromaaxis final and post overshrink cleanup
+
+The later weak-teacher `chromaaxis_4k` run became the better base than the older
+smoothgate branch. It saturated early, but its final checkpoint improved the
+real-photo chroma tail without hurting luma/detail:
+
+```text
+runs/nagiperfect_perfect_s_weakteacher_chromaaxis_4k/
+runs/nagiperfect_perfect_s_weakteacher_chromaaxis_4k/nagiperfect_perfect_s_weakteacher_chromaaxis_4k_final.pt
+```
+
+Cat noisy EXR, final checkpoint:
+
+| candidate | flat luma ratio | flat chroma ratio | luma p99 | luma visible | chroma p99 | chroma visible | edge HF |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tailquality final | 0.631 | 0.315 | 0.939 | 0.635 | 0.382 | 0.307 | 0.799 |
+| chromaaxis final | 0.623 | 0.305 | 0.936 | 0.629 | 0.369 | 0.295 | 0.796 |
+
+Discarded directions:
+
+- `chromaresidual_3k` is worse at the useful checkpoints. At 500/1000 steps it
+  regressed chroma p99/visible back to about `0.382/0.306`, so do not resume it.
+- `chroma_smooth_kernel_size=13` worsened flat chroma and visible chroma
+  compared with kernel 9, so wider uniform chroma smoothing is not the path.
+
+The useful cleanup is a post-model display-space chroma highpass overshrink
+driven by the learned `chroma_smooth_gate`. This must happen after the model
+output, not by pushing the internal `chroma_smooth_strength` beyond 1.0.
+
+Cat noisy EXR strength sweep:
+
+| post strength | flat chroma | chroma p99 | chroma visible | luma p99 | edge HF | highlight chroma drift |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.5 | 0.246 | 0.310 | 0.239 | 0.935 | 0.796 | 0.060956 |
+| 1.6 | 0.236 | 0.299 | 0.229 | 0.934 | 0.796 | 0.062494 |
+| 1.7 | 0.226 | 0.289 | 0.219 | 0.934 | 0.796 | 0.064058 |
+| 1.85 | 0.212 | 0.275 | 0.206 | 0.934 | 0.796 | 0.066448 |
+| 2.0 | 0.200 | 0.263 | 0.195 | 0.933 | 0.796 | 0.068885 |
+
+Cross-checks with the same `quality` strength 2.0:
+
+| image | flat chroma | chroma p99 | chroma visible | luma p99 | edge HF | highlight chroma drift |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| X-T5 Room | 0.292 | 0.577 | 0.277 | 0.784 | 0.821 | 0.010809 |
+| X-T5 Hydrangea | 0.093 | 0.149 | 0.089 | 0.559 | 0.881 | 0.027974 |
+
+Decision:
+
+Use `--post-chroma-overshrink-preset quality` as the current practical best.
+It maps to strength `2.0`; `balanced` maps to `1.6` if a future image shows
+visible desaturation. The default preset stays `off` for backwards-compatible
+script behavior.
