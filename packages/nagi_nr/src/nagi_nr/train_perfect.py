@@ -111,6 +111,12 @@ def _masked_charbonnier(
     return loss / (mask_mean * mask.numel())
 
 
+def _chroma_axes(x: torch.Tensor) -> torch.Tensor:
+    rg = x[:, 0:1] - x[:, 1:2]
+    by = x[:, 2:3] - 0.5 * (x[:, 0:1] + x[:, 1:2])
+    return torch.cat([rg, by], dim=1)
+
+
 def weak_teacher_loss(
     pred: torch.Tensor | dict[str, torch.Tensor],
     teacher: torch.Tensor,
@@ -124,6 +130,9 @@ def weak_teacher_loss(
     chroma_hf_weight: float,
     chroma_hf_tail_weight: float,
     chroma_hf_tail_fraction: float,
+    chroma_axis_hf_weight: float,
+    chroma_axis_hf_tail_weight: float,
+    chroma_axis_hf_tail_fraction: float,
     hf_kernel_size: int,
     charbonnier_eps: float,
 ) -> dict[str, torch.Tensor]:
@@ -180,6 +189,27 @@ def weak_teacher_loss(
         k = max(1, int(tail.shape[1] * fraction))
         chroma_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
 
+    out_axis = _chroma_axes(output_srgb)
+    teacher_axis = _chroma_axes(teacher_srgb)
+    out_axis_hf = out_axis - _local_mean(out_axis, hf_kernel_size)
+    teacher_axis_hf = teacher_axis - _local_mean(teacher_axis, hf_kernel_size)
+    loss_chroma_axis_hf = _masked_charbonnier(
+        out_axis_hf - teacher_axis_hf,
+        mask,
+        charbonnier_eps=charbonnier_eps,
+    )
+    chroma_axis_hf_tail = torch.zeros((), dtype=output.dtype, device=output.device)
+    if chroma_axis_hf_tail_weight > 0.0:
+        axis_diff = out_axis_hf - teacher_axis_hf
+        rg = axis_diff[:, 0:1]
+        by = axis_diff[:, 1:2]
+        tail = torch.sqrt(0.5 * (rg.pow(2) + by.pow(2)) + float(charbonnier_eps) ** 2)
+        tail = tail * mask
+        tail = tail.flatten(1)
+        fraction = max(min(float(chroma_axis_hf_tail_fraction), 1.0), 1.0e-6)
+        k = max(1, int(tail.shape[1] * fraction))
+        chroma_axis_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
+
     total = (
         float(luma_weight) * loss_luma
         + float(chroma_weight) * loss_chroma
@@ -187,6 +217,8 @@ def weak_teacher_loss(
         + float(luma_hf_tail_weight) * luma_hf_tail
         + float(chroma_hf_weight) * loss_chroma_hf
         + float(chroma_hf_tail_weight) * chroma_hf_tail
+        + float(chroma_axis_hf_weight) * loss_chroma_axis_hf
+        + float(chroma_axis_hf_tail_weight) * chroma_axis_hf_tail
     )
     return {
         "total": total,
@@ -196,6 +228,8 @@ def weak_teacher_loss(
         "weak_luma_hf_tail": luma_hf_tail.detach(),
         "weak_chroma_hf": loss_chroma_hf.detach(),
         "weak_chroma_hf_tail": chroma_hf_tail.detach(),
+        "weak_chroma_axis_hf": loss_chroma_axis_hf.detach(),
+        "weak_chroma_axis_hf_tail": chroma_axis_hf_tail.detach(),
         "weak_mask": mask.mean().detach(),
     }
 
@@ -517,6 +551,9 @@ def main() -> None:
                     chroma_hf_weight=float(weak_cfg.get("chroma_hf_weight", 0.0)),
                     chroma_hf_tail_weight=float(weak_cfg.get("chroma_hf_tail_weight", 0.0)),
                     chroma_hf_tail_fraction=float(weak_cfg.get("chroma_hf_tail_fraction", 0.02)),
+                    chroma_axis_hf_weight=float(weak_cfg.get("chroma_axis_hf_weight", 0.0)),
+                    chroma_axis_hf_tail_weight=float(weak_cfg.get("chroma_axis_hf_tail_weight", 0.0)),
+                    chroma_axis_hf_tail_fraction=float(weak_cfg.get("chroma_axis_hf_tail_fraction", 0.02)),
                     hf_kernel_size=int(weak_cfg.get("hf_kernel_size", 9)),
                     charbonnier_eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
                 )
@@ -529,6 +566,8 @@ def main() -> None:
                     "weak_luma_hf_tail",
                     "weak_chroma_hf",
                     "weak_chroma_hf_tail",
+                    "weak_chroma_axis_hf",
+                    "weak_chroma_axis_hf_tail",
                     "weak_mask",
                 ):
                     losses[key] = weak_losses[key]
@@ -609,6 +648,8 @@ def main() -> None:
                 "weak_luma_hf_tail",
                 "weak_chroma_hf",
                 "weak_chroma_hf_tail",
+                "weak_chroma_axis_hf",
+                "weak_chroma_axis_hf_tail",
                 "weak_mask",
             ):
                 if key in accum_log:
