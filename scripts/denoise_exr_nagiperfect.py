@@ -14,6 +14,8 @@ from scipy.ndimage import uniform_filter
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "nagi_nr" / "src"))
 
 from nagi_nr.nagiperfect import NagiPerfect, build_nagiperfect_preset
+from apply_luma_hf_shrink_filter import PRESETS as LUMA_HF_PRESETS
+from apply_luma_hf_shrink_filter import apply_luma_hf_shrink
 from perfect_nr_probe import image_stats, make_preview, read_image
 from perfect_nr_detail_guard import write_exr, write_tiff
 
@@ -22,6 +24,12 @@ POST_CHROMA_OVERSHRINK_PRESETS = {
     "off": 1.0,
     "balanced": 1.6,
     "quality": 2.0,
+}
+
+POST_LUMA_HF_PRESETS = {
+    "off": None,
+    "balanced": "xstrong",
+    "quality": "ultra",
 }
 
 
@@ -309,6 +317,12 @@ def main() -> None:
         help="Override the post chroma cleanup strength. Values above 1.0 enable cleanup.",
     )
     parser.add_argument("--post-chroma-overshrink-kernel-size", type=int, default=9)
+    parser.add_argument(
+        "--post-luma-hf-preset",
+        choices=sorted(POST_LUMA_HF_PRESETS),
+        default="off",
+        help="Post display-luma grain cleanup preset. 'quality' maps to the validated ultra shrink.",
+    )
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
@@ -366,6 +380,35 @@ def main() -> None:
             strength=post_chroma_overshrink_strength,
             kernel_size=int(args.post_chroma_overshrink_kernel_size),
         )
+    post_luma_hf_stats = None
+    post_luma_hf_gate = None
+    post_luma_hf_source = POST_LUMA_HF_PRESETS[args.post_luma_hf_preset]
+    if post_luma_hf_source is not None:
+        params = dict(LUMA_HF_PRESETS[post_luma_hf_source])
+        output, post_luma_hf_stats, post_luma_hf_gate = apply_luma_hf_shrink(
+            output,
+            image,
+            strength=float(params["strength"]),
+            low_sigma=float(params["low_sigma"]),
+            shrink_threshold=float(params["shrink_threshold"]),
+            detail_preserve_threshold=float(params["detail_preserve_threshold"]),
+            detail_preserve_transition=float(params["detail_preserve_transition"]),
+            shadow_boost=float(params["shadow_boost"]),
+            shadow_threshold=0.18,
+            shadow_transition=0.08,
+            structure_sigma=1.2,
+            detail_sigma=2.8,
+            detail_threshold=0.018,
+            detail_transition=0.010,
+            edge_sigma=1.0,
+            edge_threshold=0.030,
+            edge_transition=0.015,
+            highlight_threshold=1.0,
+            highlight_transition=0.25,
+            hdr_restore_peak_threshold=0.95,
+            hdr_restore_threshold=0.85,
+            hdr_restore_transition=0.25,
+        )
 
     exr_path = out_dir / f"{name}_nagiperfect.exr"
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
@@ -373,6 +416,7 @@ def main() -> None:
     confidence_path = out_dir / f"{name}_detail_confidence.png"
     chroma_smooth_gate_path = out_dir / f"{name}_chroma_smooth_gate.png"
     luma_smooth_gate_path = out_dir / f"{name}_luma_smooth_gate.png"
+    luma_hf_gate_path = out_dir / f"{name}_post_luma_hf_gate.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
 
     write_exr(exr_path, output)
@@ -390,6 +434,10 @@ def main() -> None:
         Image.fromarray((np.clip(extras["luma_smooth_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
             luma_smooth_gate_path
         )
+    if post_luma_hf_gate is not None:
+        Image.fromarray((np.clip(post_luma_hf_gate, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            luma_hf_gate_path
+        )
 
     meta = {
         "input": str(input_path),
@@ -403,6 +451,7 @@ def main() -> None:
             "detail_confidence": str(confidence_path) if "detail_confidence" in extras else None,
             "chroma_smooth_gate": str(chroma_smooth_gate_path) if "chroma_smooth_gate" in extras else None,
             "luma_smooth_gate": str(luma_smooth_gate_path) if "luma_smooth_gate" in extras else None,
+            "post_luma_hf_gate": str(luma_hf_gate_path) if post_luma_hf_gate is not None else None,
         },
         "input_stats": image_stats(image),
         "output_stats": image_stats(output),
@@ -428,6 +477,11 @@ def main() -> None:
             "strength": float(getattr(model, "luma_smooth_strength", 0.0)),
             "kernel_size": int(getattr(model, "luma_smooth_kernel_size", 0)),
             "gate_bias_override": args.luma_smooth_gate_bias,
+        },
+        "post_luma_hf": {
+            "preset": args.post_luma_hf_preset,
+            "source_preset": post_luma_hf_source,
+            "stats": post_luma_hf_stats,
         },
         "tiling": {
             "tile_size": int(args.tile_size),

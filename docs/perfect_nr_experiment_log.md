@@ -1525,3 +1525,38 @@ Use `--post-chroma-overshrink-preset quality` as the current practical best.
 It maps to strength `2.0`; `balanced` maps to `1.6` if a future image shows
 visible desaturation. The default preset stays `off` for backwards-compatible
 script behavior.
+
+### Post luma HF cleanup after chromaaxis quality
+
+After chroma overshrink, the remaining visible defect is mostly display-luma
+grain. The previous learned luma-push directions were risky because they traded
+real-photo edge/highlight safety for denoise. A smaller post step is more
+controllable: shrink only small display-luma high-frequency residuals under a
+flat/non-edge/highlight-safe gate.
+
+Tested `apply_luma_hf_shrink_filter.py` on top of chromaaxis quality. Cat noisy
+EXR sweep:
+
+| candidate | flat luma | luma p99 | luma visible | chroma p99 | chroma visible | edge HF |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| chromaaxis quality | 0.619 | 0.933 | 0.626 | 0.263 | 0.195 | 0.796 |
+| luma hf strong | 0.479 | 0.872 | 0.486 | 0.263 | 0.197 | 0.788 |
+| luma hf xstrong | 0.405 | 0.837 | 0.411 | 0.263 | 0.197 | 0.783 |
+| luma hf ultra | 0.277 | 0.754 | 0.282 | 0.264 | 0.199 | 0.773 |
+
+Cross-checks for the `ultra` luma cleanup:
+
+| image | luma visible before | luma visible after | edge HF before | edge HF after | chroma visible before | chroma visible after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| X-T5 Room | 0.529 | 0.340 | 0.821 | 0.815 | 0.277 | 0.288 |
+| X-T5 Hydrangea | 0.491 | 0.205 | 0.881 | 0.877 | 0.089 | 0.094 |
+
+Decision:
+
+Keep this branch. It meaningfully reduces the remaining luma grain while the
+edge cost is small on three real photos. The slight chroma visible regression is
+expected because luma/chroma decomposition changes a little after luma
+reconstruction; it remains far below the original. Integrated this as
+`--post-luma-hf-preset quality`, which maps to the existing `ultra` luma-HF
+filter. Existing chroma-only `quality` tasks are preserved; new `quality-plus`
+tasks enable both post chroma and post luma cleanup.
