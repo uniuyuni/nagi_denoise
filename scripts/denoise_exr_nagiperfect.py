@@ -9,12 +9,53 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from scipy.ndimage import uniform_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "nagi_nr" / "src"))
 
 from nagi_nr.nagiperfect import NagiPerfect, build_nagiperfect_preset
 from perfect_nr_probe import image_stats, make_preview, read_image
 from perfect_nr_detail_guard import write_exr, write_tiff
+
+
+def linear_to_srgb_hdr(image: np.ndarray) -> np.ndarray:
+    x = np.asarray(image, dtype=np.float32)
+    is_low = x <= 0.0031308
+    low = x * 12.92
+    base = np.where(is_low, 1.0, np.maximum(x, 0.0))
+    high = 1.055 * np.power(base, 1.0 / 2.4) - 0.055
+    return np.where(is_low, low, high).astype(np.float32, copy=False)
+
+
+def srgb_to_linear_hdr(image: np.ndarray) -> np.ndarray:
+    x = np.asarray(image, dtype=np.float32)
+    low = x / 12.92
+    high = np.power((np.maximum(x, 0.0) + 0.055) / 1.055, 2.4)
+    return np.where(x <= 0.04045, low, high).astype(np.float32, copy=False)
+
+
+def post_chroma_overshrink(
+    image: np.ndarray,
+    gate: np.ndarray,
+    *,
+    strength: float,
+    kernel_size: int,
+) -> np.ndarray:
+    extra = max(float(strength) - 1.0, 0.0)
+    if extra <= 0.0:
+        return image
+    k = max(1, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    display = linear_to_srgb_hdr(np.clip(image, 0.0, None))
+    y = (display[..., 0:1] * 0.299 + display[..., 1:2] * 0.587 + display[..., 2:3] * 0.114).astype(np.float32)
+    chroma = display - y
+    smooth = np.empty_like(chroma)
+    for channel in range(3):
+        smooth[..., channel] = uniform_filter(chroma[..., channel], size=k, mode="reflect")
+    high = chroma - smooth
+    corrected_display = np.maximum(display - extra * np.clip(gate, 0.0, 1.0)[..., None] * high, 0.0)
+    return np.clip(srgb_to_linear_hdr(corrected_display), 0.0, None)
 
 
 def load_model(weights: Path, device: torch.device, state_key: str) -> NagiPerfect:
@@ -248,6 +289,8 @@ def main() -> None:
     parser.add_argument("--highlight-protect-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-strength", type=float, default=None)
     parser.add_argument("--chroma-smooth-gate-bias", type=float, default=None)
+    parser.add_argument("--post-chroma-overshrink-strength", type=float, default=1.0)
+    parser.add_argument("--post-chroma-overshrink-kernel-size", type=int, default=9)
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
@@ -281,15 +324,26 @@ def main() -> None:
     if args.luma_smooth_gate_bias is not None and getattr(model, "luma_smooth_head", None) is not None:
         with torch.no_grad():
             model.luma_smooth_head.bias.fill_(float(args.luma_smooth_gate_bias))
+    post_chroma_overshrink_strength = float(args.post_chroma_overshrink_strength)
+    need_diagnostics = (not bool(args.fast)) or post_chroma_overshrink_strength > 1.0
     output, extras = run_tiled_image(
         model,
         image,
         device=device,
         tile_size=int(args.tile_size),
         overlap=int(args.tile_overlap),
-        diagnostics=not bool(args.fast),
+        diagnostics=need_diagnostics,
         progress=not bool(args.quiet_tiles),
     )
+    if post_chroma_overshrink_strength > 1.0:
+        if "chroma_smooth_gate" not in extras:
+            raise RuntimeError("post chroma overshrink requires chroma_smooth_gate diagnostics")
+        output = post_chroma_overshrink(
+            output,
+            extras["chroma_smooth_gate"],
+            strength=post_chroma_overshrink_strength,
+            kernel_size=int(args.post_chroma_overshrink_kernel_size),
+        )
 
     exr_path = out_dir / f"{name}_nagiperfect.exr"
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
@@ -343,6 +397,8 @@ def main() -> None:
             "strength": float(getattr(model, "chroma_smooth_strength", 0.0)),
             "kernel_size": int(getattr(model, "chroma_smooth_kernel_size", 0)),
             "gate_bias_override": args.chroma_smooth_gate_bias,
+            "post_overshrink_strength": post_chroma_overshrink_strength,
+            "post_overshrink_kernel_size": int(args.post_chroma_overshrink_kernel_size),
         },
         "luma_smooth": {
             "enabled": bool(getattr(model, "luma_smooth_branch", False)),
