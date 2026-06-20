@@ -14,10 +14,11 @@ import yaml
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from .data import ChunkedShuffleSampler, SIDDPatchDataset, find_polyu_pairs, find_sidd_pairs
+from .data import ChunkedShuffleSampler, SIDDPatchDataset, WeakTeacherPatchDataset, find_polyu_pairs, find_sidd_pairs
 from .devices import resolve_device
 from .losses import NagiPerfectLoss
 from .nagiperfect import NagiPerfect, build_nagiperfect_preset
+from .transforms import linear_to_srgb
 
 
 def lr_at(step: int, total: int, warmup: int, lr: float, lr_min: float) -> float:
@@ -76,6 +77,46 @@ def build_model(cfg: dict) -> NagiPerfect:
             model = NagiPerfect(**merged)
         return model
     return NagiPerfect(**model_cfg)
+
+
+def _srgb_luma(x: torch.Tensor) -> torch.Tensor:
+    weights = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    return (x[:, :3] * weights).sum(dim=1, keepdim=True)
+
+
+def weak_teacher_loss(
+    pred: torch.Tensor | dict[str, torch.Tensor],
+    teacher: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    luma_weight: float,
+    chroma_weight: float,
+    charbonnier_eps: float,
+) -> dict[str, torch.Tensor]:
+    output = pred["output"] if isinstance(pred, dict) else pred
+    output_srgb = linear_to_srgb(output)
+    teacher_srgb = linear_to_srgb(teacher)
+    mask = mask.to(dtype=output.dtype).clamp(0.0, 1.0)
+    mask_mean = mask.mean().clamp_min(1.0e-6)
+    eps2 = float(charbonnier_eps) ** 2
+
+    out_y = _srgb_luma(output_srgb)
+    teacher_y = _srgb_luma(teacher_srgb)
+    loss_luma = (torch.sqrt((out_y - teacher_y).pow(2) + eps2) * mask).sum()
+    loss_luma = loss_luma / (mask_mean * mask.numel())
+
+    out_chroma = output_srgb - out_y
+    teacher_chroma = teacher_srgb - teacher_y
+    mask_rgb = mask.expand(-1, 3, -1, -1)
+    loss_chroma = (torch.sqrt((out_chroma - teacher_chroma).pow(2) + eps2) * mask_rgb).sum()
+    loss_chroma = loss_chroma / (mask_mean * mask.numel() * 3.0)
+    total = float(luma_weight) * loss_luma + float(chroma_weight) * loss_chroma
+    return {
+        "total": total,
+        "weak_luma": loss_luma.detach(),
+        "weak_chroma": loss_chroma.detach(),
+        "weak_mask": mask.mean().detach(),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +198,47 @@ def main() -> None:
     if num_workers > 0 and "prefetch_factor" in data_cfg:
         dl_kwargs["prefetch_factor"] = int(data_cfg["prefetch_factor"])
     dl = DataLoader(ds, **dl_kwargs)
+
+    weak_dl = None
+    weak_cfg = dict(cfg.get("weak_teacher") or {})
+    if weak_cfg.get("enabled", False):
+        weak_pairs_cfg = weak_cfg.get("pairs") or []
+        weak_pairs: list[tuple[str, str]] = []
+        for item in weak_pairs_cfg:
+            if isinstance(item, dict):
+                weak_pairs.append((str(item["noisy"]), str(item["teacher"])))
+            else:
+                weak_pairs.append((str(item[0]), str(item[1])))
+        weak_ds = WeakTeacherPatchDataset(
+            pairs=weak_pairs,
+            patch_size=int(weak_cfg.get("patch_size", data_cfg["patch_size"])),
+            patches_per_image=int(weak_cfg.get("patches_per_image", 64)),
+            exposure_jitter=tuple(weak_cfg["exposure_jitter"]) if weak_cfg.get("exposure_jitter") else None,
+            flip_rot=bool(weak_cfg.get("flip_rot", True)),
+            seed=args.seed + int(weak_cfg.get("seed_offset", 100000)),
+            randomize_each_access=bool(weak_cfg.get("randomize_each_access", True)),
+            structure_sigma=float(weak_cfg.get("structure_sigma", 1.2)),
+            detail_sigma=float(weak_cfg.get("detail_sigma", 2.8)),
+            detail_threshold=float(weak_cfg.get("detail_threshold", 0.018)),
+            detail_transition=float(weak_cfg.get("detail_transition", 0.010)),
+            edge_sigma=float(weak_cfg.get("edge_sigma", 1.0)),
+            edge_threshold=float(weak_cfg.get("edge_threshold", 0.030)),
+            edge_transition=float(weak_cfg.get("edge_transition", 0.015)),
+            highlight_threshold=float(weak_cfg.get("highlight_threshold", 1.0)),
+            highlight_transition=float(weak_cfg.get("highlight_transition", 0.25)),
+            delta_threshold=float(weak_cfg.get("delta_threshold", 0.002)),
+            delta_transition=float(weak_cfg.get("delta_transition", 0.010)),
+            min_mask_mean=float(weak_cfg.get("min_mask_mean", 0.02)),
+        )
+        weak_dl = DataLoader(
+            weak_ds,
+            batch_size=int(weak_cfg.get("batch_size", cfg["train"]["batch_size"])),
+            shuffle=True,
+            num_workers=int(weak_cfg.get("num_workers", 0)),
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+        )
+        print(f"weak teacher pairs: {len(weak_ds.pairs)}, items: {len(weak_ds)}")
 
     model = build_model(cfg).to(device=device, dtype=torch.float32)
     ema = deepcopy(model)
@@ -299,6 +381,7 @@ def main() -> None:
     log_f.write(f"\n=== train-perfect {prefix} ===\n")
 
     data_iter = iter(dl)
+    weak_iter = iter(weak_dl) if weak_dl is not None else None
     step = start_step
     t0 = time.time()
     model.train()
@@ -321,6 +404,28 @@ def main() -> None:
             clean = clean.to(device, non_blocking=True)
             pred = model(noisy, return_aux=True)
             losses = criterion(pred, clean)
+            if weak_dl is not None and weak_iter is not None:
+                try:
+                    weak_noisy, weak_teacher, weak_mask = next(weak_iter)
+                except StopIteration:
+                    weak_iter = iter(weak_dl)
+                    weak_noisy, weak_teacher, weak_mask = next(weak_iter)
+                weak_noisy = weak_noisy.to(device, non_blocking=True)
+                weak_teacher = weak_teacher.to(device, non_blocking=True)
+                weak_mask = weak_mask.to(device, non_blocking=True)
+                weak_pred = model(weak_noisy, return_aux=True)
+                weak_losses = weak_teacher_loss(
+                    weak_pred,
+                    weak_teacher,
+                    weak_mask,
+                    luma_weight=float(weak_cfg.get("luma_weight", 0.0)),
+                    chroma_weight=float(weak_cfg.get("chroma_weight", 0.0)),
+                    charbonnier_eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
+                )
+                weak_total = weak_losses["total"] * float(weak_cfg.get("weight", 1.0))
+                losses["total"] = losses["total"] + weak_total
+                for key in ("weak_luma", "weak_chroma", "weak_mask"):
+                    losses[key] = weak_losses[key]
             if not torch.isfinite(losses["total"]).item():
                 msg = f"[fatal {step:7d}] non-finite loss detected; stopping before optimizer step/checkpoint"
                 print(msg)
@@ -371,6 +476,9 @@ def main() -> None:
                 "highlight_luma_weight",
                 "highlight_chroma_weight",
                 "highlight_ratio_weight",
+                "weak_luma",
+                "weak_chroma",
+                "weak_mask",
             ):
                 if key in accum_log:
                     msg += f"{key}={accum_log[key]:.4f} "

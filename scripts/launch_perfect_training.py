@@ -32,6 +32,7 @@ VARIANTS = {
     "perfect_s_strictflat_5k": "packages/nagi_nr/configs/nagiperfect_s_strictflat_5k.yaml",
     "perfect_s_strictflat_2k": "packages/nagi_nr/configs/nagiperfect_s_strictflat_2k.yaml",
     "perfect_s_tailpush_3k": "packages/nagi_nr/configs/nagiperfect_s_tailpush_3k.yaml",
+    "perfect_s_weakteacher_500": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_500.yaml",
 }
 
 

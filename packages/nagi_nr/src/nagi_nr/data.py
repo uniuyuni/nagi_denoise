@@ -35,6 +35,63 @@ from PIL import Image
 from .transforms import srgb_to_linear
 
 
+LUMA_SRGB = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+LUMA_LINEAR = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+
+def _linear_to_srgb_np(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, None).astype(np.float32, copy=False)
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+
+
+def _luma_np(rgb: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    return np.sum(rgb[..., :3].astype(np.float32, copy=False) * weights.reshape(1, 1, 3), axis=2)
+
+
+def _sigmoid01_np(x: np.ndarray) -> np.ndarray:
+    z = np.clip(x, -80.0, 80.0)
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32, copy=False)
+
+
+def _smoothstep_np(x: np.ndarray) -> np.ndarray:
+    t = np.clip(x, 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32, copy=False)
+
+
+def _read_exr_rgb(path: Path) -> np.ndarray:
+    import OpenEXR
+
+    file = OpenEXR.InputFile(str(path))
+    header = file.header()
+    dw = header["dataWindow"]
+    width = dw.max.x - dw.min.x + 1
+    height = dw.max.y - dw.min.y + 1
+    channels = header["channels"]
+    names = ["R", "G", "B"] if all(c in channels for c in ("R", "G", "B")) else list(channels)[:3]
+    arrs = [np.frombuffer(file.channel(c), dtype=np.float32).reshape(height, width) for c in names]
+    return np.stack(arrs, axis=2).astype(np.float32, copy=False)
+
+
+def _read_float_rgb(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".exr":
+        arr = _read_exr_rgb(path)
+    elif suffix in {".tif", ".tiff"}:
+        import tifffile
+
+        arr = tifffile.imread(path).astype(np.float32)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)
+        if arr.max(initial=0.0) > 4.0:
+            arr = arr / np.float32(np.iinfo(arr.dtype).max if np.issubdtype(arr.dtype, np.integer) else 65535.0)
+    else:
+        with Image.open(path) as im:
+            srgb = np.array(im.convert("RGB"), dtype=np.float32) / 255.0
+        return srgb_to_linear(torch.from_numpy(srgb).permute(2, 0, 1)).permute(1, 2, 0).numpy()
+    return np.nan_to_num(arr[..., :3], nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32, copy=False)
+
+
 # ---- Synthetic degradations (sRGB uint8 space) ----
 def _jpeg_recompress(img_u8: np.ndarray, q: int) -> np.ndarray:
     """Encode then decode as JPEG to inject compression artifacts."""
@@ -311,6 +368,157 @@ class SIDDPatchDataset(Dataset):
         if self.return_teacher:
             return views[0], views[1], views[2], float(has_teacher)
         return views[0], views[1]
+
+
+class WeakTeacherPatchDataset(Dataset):
+    """Random patches from real photos with weak pseudo-teacher supervision.
+
+    The pseudo teacher is not treated as ground truth everywhere. Each sample
+    includes a confidence mask that selects flat, non-edge, non-highlight regions
+    where teacher-like denoising is least likely to damage real detail.
+    """
+
+    def __init__(
+        self,
+        pairs: Iterable[Tuple[str, str]],
+        patch_size: int = 128,
+        patches_per_image: int = 32,
+        exposure_jitter: Optional[Tuple[float, float]] = None,
+        flip_rot: bool = True,
+        seed: int = 0,
+        randomize_each_access: bool = True,
+        structure_sigma: float = 1.2,
+        detail_sigma: float = 2.8,
+        detail_threshold: float = 0.018,
+        detail_transition: float = 0.010,
+        edge_sigma: float = 1.0,
+        edge_threshold: float = 0.030,
+        edge_transition: float = 0.015,
+        highlight_threshold: float = 1.0,
+        highlight_transition: float = 0.25,
+        delta_threshold: float = 0.002,
+        delta_transition: float = 0.010,
+        min_mask_mean: float = 0.02,
+    ):
+        super().__init__()
+        self.pairs = list(pairs)
+        if not self.pairs:
+            raise ValueError("WeakTeacherPatchDataset requires at least one pair")
+        if patch_size % 8 != 0:
+            raise ValueError("patch_size must be a multiple of 8")
+        self.patch_size = int(patch_size)
+        self.patches_per_image = int(patches_per_image)
+        self.exposure_jitter = exposure_jitter
+        self.flip_rot = bool(flip_rot)
+        self._base_seed = int(seed)
+        self.randomize_each_access = bool(randomize_each_access)
+        self._access_counter = 0
+        self.structure_sigma = float(structure_sigma)
+        self.detail_sigma = float(detail_sigma)
+        self.detail_threshold = float(detail_threshold)
+        self.detail_transition = float(detail_transition)
+        self.edge_sigma = float(edge_sigma)
+        self.edge_threshold = float(edge_threshold)
+        self.edge_transition = float(edge_transition)
+        self.highlight_threshold = float(highlight_threshold)
+        self.highlight_transition = float(highlight_transition)
+        self.delta_threshold = float(delta_threshold)
+        self.delta_transition = float(delta_transition)
+        self.min_mask_mean = float(min_mask_mean)
+        self._cache_pair_idx: int = -1
+        self._cache_noisy: Optional[np.ndarray] = None
+        self._cache_teacher: Optional[np.ndarray] = None
+        self._cache_mask: Optional[np.ndarray] = None
+
+    def __len__(self) -> int:
+        return len(self.pairs) * self.patches_per_image
+
+    def _make_mask(self, noisy: np.ndarray, teacher: np.ndarray) -> np.ndarray:
+        from scipy.ndimage import gaussian_filter, gaussian_gradient_magnitude
+
+        guide = np.clip(_linear_to_srgb_np(teacher), 0.0, 1.0)
+        guide_y = _luma_np(guide, LUMA_SRGB)
+        guide_y_linear = _luma_np(np.clip(teacher, 0.0, None), LUMA_LINEAR)
+        structure = gaussian_filter(guide_y, sigma=self.structure_sigma, mode="reflect")
+        detail = np.abs(structure - gaussian_filter(structure, sigma=self.detail_sigma, mode="reflect"))
+        edge = gaussian_gradient_magnitude(structure, sigma=self.edge_sigma, mode="reflect")
+        flat = _sigmoid01_np((self.detail_threshold - detail) / max(self.detail_transition, 1.0e-6))
+        non_edge = _sigmoid01_np((self.edge_threshold - edge) / max(self.edge_transition, 1.0e-6))
+        highlight = _smoothstep_np((guide_y_linear - self.highlight_threshold) / max(self.highlight_transition, 1.0e-6))
+
+        noisy_srgb = np.clip(_linear_to_srgb_np(noisy), 0.0, 1.0)
+        delta = np.sqrt(np.sum((guide - noisy_srgb) ** 2, axis=2))
+        # Ignore places where teacher is almost identical to input: those patches
+        # teach little except identity, and can drown out the useful weak signal.
+        changed = _sigmoid01_np((delta - self.delta_threshold) / max(self.delta_transition, 1.0e-6))
+        mask = (flat * non_edge * (1.0 - highlight) * changed).astype(np.float32, copy=False)
+        return mask[..., None]
+
+    def _get_pair(self, pair_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._cache_pair_idx != pair_idx:
+            noisy_path, teacher_path = self.pairs[pair_idx]
+            noisy = _read_float_rgb(noisy_path)
+            teacher = _read_float_rgb(teacher_path)
+            if noisy.shape[:2] != teacher.shape[:2]:
+                raise ValueError(f"weak teacher shape mismatch: {noisy_path} {noisy.shape} vs {teacher_path} {teacher.shape}")
+            self._cache_noisy = noisy
+            self._cache_teacher = teacher
+            self._cache_mask = self._make_mask(noisy, teacher)
+            self._cache_pair_idx = pair_idx
+        return self._cache_noisy, self._cache_teacher, self._cache_mask  # type: ignore[return-value]
+
+    def __getitem__(self, idx: int):
+        extra = 0
+        if self.randomize_each_access:
+            self._access_counter += 1
+            extra = self._access_counter * 1597334677
+        rng = np.random.default_rng((self._base_seed + idx * 2654435761 + extra) & 0xFFFFFFFF)
+        pair_idx = idx // self.patches_per_image
+        noisy, teacher, mask = self._get_pair(pair_idx)
+
+        H, W, _ = noisy.shape
+        ps = self.patch_size
+        if H < ps or W < ps:
+            raise RuntimeError(f"Weak teacher image too small ({H}x{W}) for patch {ps}")
+
+        for _attempt in range(16):
+            y = int(rng.integers(0, H - ps + 1))
+            x = int(rng.integers(0, W - ps + 1))
+            mask_p = mask[y : y + ps, x : x + ps]
+            if float(mask_p.mean()) >= self.min_mask_mean:
+                break
+        noisy_p = noisy[y : y + ps, x : x + ps]
+        teacher_p = teacher[y : y + ps, x : x + ps]
+
+        def _to_tensor_linear(arr: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).float()
+
+        noisy_t = _to_tensor_linear(noisy_p)
+        teacher_t = _to_tensor_linear(teacher_p)
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask_p[..., 0])).unsqueeze(0).float()
+
+        if self.exposure_jitter is not None:
+            lo, hi = self.exposure_jitter
+            scale = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            noisy_t.mul_(scale)
+            teacher_t.mul_(scale)
+
+        if self.flip_rot:
+            fx = rng.random() < 0.5
+            fy = rng.random() < 0.5
+            k = int(rng.integers(0, 4))
+            views = [noisy_t, teacher_t, mask_t]
+            for i, v in enumerate(views):
+                if fx:
+                    v = v.flip(-1)
+                if fy:
+                    v = v.flip(-2)
+                if k:
+                    v = torch.rot90(v, k, dims=(-2, -1))
+                views[i] = v.contiguous()
+            noisy_t, teacher_t, mask_t = views
+
+        return noisy_t, teacher_t, mask_t
 
 
 class ChunkedShuffleSampler(Sampler[int]):
