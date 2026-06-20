@@ -119,6 +119,8 @@ def weak_teacher_loss(
     luma_weight: float,
     chroma_weight: float,
     luma_hf_weight: float,
+    luma_hf_tail_weight: float,
+    luma_hf_tail_fraction: float,
     chroma_hf_weight: float,
     chroma_hf_tail_weight: float,
     chroma_hf_tail_fraction: float,
@@ -153,6 +155,14 @@ def weak_teacher_loss(
         mask,
         charbonnier_eps=charbonnier_eps,
     )
+    luma_hf_tail = torch.zeros((), dtype=output.dtype, device=output.device)
+    if luma_hf_tail_weight > 0.0:
+        tail = torch.sqrt((out_y_hf - teacher_y_hf).pow(2) + float(charbonnier_eps) ** 2)
+        tail = tail * mask.expand_as(tail)
+        tail = tail.flatten(1)
+        fraction = max(min(float(luma_hf_tail_fraction), 1.0), 1.0e-6)
+        k = max(1, int(tail.shape[1] * fraction))
+        luma_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
 
     out_chroma_hf = out_chroma - _local_mean(out_chroma, hf_kernel_size)
     teacher_chroma_hf = teacher_chroma - _local_mean(teacher_chroma, hf_kernel_size)
@@ -174,6 +184,7 @@ def weak_teacher_loss(
         float(luma_weight) * loss_luma
         + float(chroma_weight) * loss_chroma
         + float(luma_hf_weight) * loss_luma_hf
+        + float(luma_hf_tail_weight) * luma_hf_tail
         + float(chroma_hf_weight) * loss_chroma_hf
         + float(chroma_hf_tail_weight) * chroma_hf_tail
     )
@@ -182,6 +193,7 @@ def weak_teacher_loss(
         "weak_luma": loss_luma.detach(),
         "weak_chroma": loss_chroma.detach(),
         "weak_luma_hf": loss_luma_hf.detach(),
+        "weak_luma_hf_tail": luma_hf_tail.detach(),
         "weak_chroma_hf": loss_chroma_hf.detach(),
         "weak_chroma_hf_tail": chroma_hf_tail.detach(),
         "weak_mask": mask.mean().detach(),
@@ -500,6 +512,8 @@ def main() -> None:
                     luma_weight=float(weak_cfg.get("luma_weight", 0.0)),
                     chroma_weight=float(weak_cfg.get("chroma_weight", 0.0)),
                     luma_hf_weight=float(weak_cfg.get("luma_hf_weight", 0.0)),
+                    luma_hf_tail_weight=float(weak_cfg.get("luma_hf_tail_weight", 0.0)),
+                    luma_hf_tail_fraction=float(weak_cfg.get("luma_hf_tail_fraction", 0.02)),
                     chroma_hf_weight=float(weak_cfg.get("chroma_hf_weight", 0.0)),
                     chroma_hf_tail_weight=float(weak_cfg.get("chroma_hf_tail_weight", 0.0)),
                     chroma_hf_tail_fraction=float(weak_cfg.get("chroma_hf_tail_fraction", 0.02)),
@@ -512,6 +526,7 @@ def main() -> None:
                     "weak_luma",
                     "weak_chroma",
                     "weak_luma_hf",
+                    "weak_luma_hf_tail",
                     "weak_chroma_hf",
                     "weak_chroma_hf_tail",
                     "weak_mask",
@@ -591,6 +606,7 @@ def main() -> None:
                 "weak_luma",
                 "weak_chroma",
                 "weak_luma_hf",
+                "weak_luma_hf_tail",
                 "weak_chroma_hf",
                 "weak_chroma_hf_tail",
                 "weak_mask",
