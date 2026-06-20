@@ -34,6 +34,14 @@ CHROMA_PRESETS = {
 LUMA_PRESETS = {
     "balanced": {"gate_gain": 1.15, "gate_bias": 0.0, "strength": 0.75, "radius": 5, "eps": 0.006},
     "strong": {"gate_gain": 1.35, "gate_bias": 0.0, "strength": 0.95, "radius": 5, "eps": 0.006},
+    "residual_quality": {
+        "gate_gain": 1.35,
+        "gate_bias": 0.0,
+        "strength": 0.95,
+        "radius": 5,
+        "eps": 0.006,
+        "safety_gate_gain": 2.0,
+    },
 }
 
 POLISH_PRESETS = {
@@ -131,7 +139,7 @@ def main() -> None:
     parser.add_argument("--luma-preset", choices=sorted(LUMA_PRESETS), default="strong")
     parser.add_argument("--polish-preset", choices=sorted(POLISH_PRESETS), default="strong")
     parser.add_argument("--no-luma-safety-gate", action="store_true")
-    parser.add_argument("--luma-safety-gate-gain", type=float, default=1.15)
+    parser.add_argument("--luma-safety-gate-gain", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=512)
     parser.add_argument("--tile-overlap", type=int, default=64)
     parser.add_argument("--preview-exposure", type=float, default=1.0)
@@ -175,7 +183,11 @@ def main() -> None:
         strength=luma_params["strength"],
         radius=int(luma_params["radius"]),
         eps=float(luma_params["eps"]),
-        safety_gate_gain=float(args.luma_safety_gate_gain),
+        safety_gate_gain=float(
+            args.luma_safety_gate_gain
+            if args.luma_safety_gate_gain is not None
+            else luma_params.get("safety_gate_gain", 1.15)
+        ),
         use_safety_gate=not args.no_luma_safety_gate,
     )
 
