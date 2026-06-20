@@ -120,6 +120,8 @@ def weak_teacher_loss(
     chroma_weight: float,
     luma_hf_weight: float,
     chroma_hf_weight: float,
+    chroma_hf_tail_weight: float,
+    chroma_hf_tail_fraction: float,
     hf_kernel_size: int,
     charbonnier_eps: float,
 ) -> dict[str, torch.Tensor]:
@@ -159,12 +161,21 @@ def weak_teacher_loss(
         mask,
         charbonnier_eps=charbonnier_eps,
     )
+    chroma_hf_tail = torch.zeros((), dtype=output.dtype, device=output.device)
+    if chroma_hf_tail_weight > 0.0:
+        tail = torch.sqrt((out_chroma_hf - teacher_chroma_hf).pow(2) + float(charbonnier_eps) ** 2)
+        tail = tail * mask.expand_as(tail)
+        tail = tail.flatten(1)
+        fraction = max(min(float(chroma_hf_tail_fraction), 1.0), 1.0e-6)
+        k = max(1, int(tail.shape[1] * fraction))
+        chroma_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
 
     total = (
         float(luma_weight) * loss_luma
         + float(chroma_weight) * loss_chroma
         + float(luma_hf_weight) * loss_luma_hf
         + float(chroma_hf_weight) * loss_chroma_hf
+        + float(chroma_hf_tail_weight) * chroma_hf_tail
     )
     return {
         "total": total,
@@ -172,6 +183,7 @@ def weak_teacher_loss(
         "weak_chroma": loss_chroma.detach(),
         "weak_luma_hf": loss_luma_hf.detach(),
         "weak_chroma_hf": loss_chroma_hf.detach(),
+        "weak_chroma_hf_tail": chroma_hf_tail.detach(),
         "weak_mask": mask.mean().detach(),
     }
 
@@ -481,12 +493,21 @@ def main() -> None:
                     chroma_weight=float(weak_cfg.get("chroma_weight", 0.0)),
                     luma_hf_weight=float(weak_cfg.get("luma_hf_weight", 0.0)),
                     chroma_hf_weight=float(weak_cfg.get("chroma_hf_weight", 0.0)),
+                    chroma_hf_tail_weight=float(weak_cfg.get("chroma_hf_tail_weight", 0.0)),
+                    chroma_hf_tail_fraction=float(weak_cfg.get("chroma_hf_tail_fraction", 0.02)),
                     hf_kernel_size=int(weak_cfg.get("hf_kernel_size", 9)),
                     charbonnier_eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
                 )
                 weak_total = weak_losses["total"] * float(weak_cfg.get("weight", 1.0))
                 losses["total"] = losses["total"] + weak_total
-                for key in ("weak_luma", "weak_chroma", "weak_luma_hf", "weak_chroma_hf", "weak_mask"):
+                for key in (
+                    "weak_luma",
+                    "weak_chroma",
+                    "weak_luma_hf",
+                    "weak_chroma_hf",
+                    "weak_chroma_hf_tail",
+                    "weak_mask",
+                ):
                     losses[key] = weak_losses[key]
             if not torch.isfinite(losses["total"]).item():
                 msg = f"[fatal {step:7d}] non-finite loss detected; stopping before optimizer step/checkpoint"
@@ -542,6 +563,7 @@ def main() -> None:
                 "weak_chroma",
                 "weak_luma_hf",
                 "weak_chroma_hf",
+                "weak_chroma_hf_tail",
                 "weak_mask",
             ):
                 if key in accum_log:

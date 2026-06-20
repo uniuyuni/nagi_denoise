@@ -34,6 +34,7 @@ VARIANTS = {
     "perfect_s_tailpush_3k": "packages/nagi_nr/configs/nagiperfect_s_tailpush_3k.yaml",
     "perfect_s_weakteacher_500": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_500.yaml",
     "perfect_s_weakteacher_chromahead_800": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_chromahead_800.yaml",
+    "perfect_s_weakteacher_chromatail_600": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_chromatail_600.yaml",
     "perfect_s_weakteacher_hf_800": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_hf_800.yaml",
     "perfect_s_weakteacher_lumaflat_600": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_lumaflat_600.yaml",
     "perfect_s_weakteacher_smoothhead_1k": "packages/nagi_nr/configs/nagiperfect_s_weakteacher_smoothhead_1k.yaml",

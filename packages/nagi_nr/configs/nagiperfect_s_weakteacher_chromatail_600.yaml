@@ -1,0 +1,127 @@
+# NagiPerfect-S chroma-tail weak-teacher refinement.
+#
+# Purpose:
+#   The best visual candidate keeps detail but still leaves sparse magenta/cyan
+#   speckles. Continue from chromahead_800, freeze everything except the chroma
+#   smoothing head, and emphasize only the top chroma-HF residual tail.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+  chroma_gate_threshold: 0.024
+  chroma_gate_transition: 0.010
+  chroma_gate_kernel_size: 9
+  chroma_gate_highlight_threshold: 1.0
+  chroma_gate_highlight_transition: 0.2
+  chroma_gate_strength: 1.0
+  chroma_smooth_branch: true
+  chroma_smooth_strength: 1.0
+  chroma_smooth_kernel_size: 9
+  chroma_smooth_gate_bias: -2.4
+  chroma_smooth_gate_scale: 1.0
+  luma_smooth_branch: true
+  luma_smooth_strength: 0.25
+  luma_smooth_kernel_size: 5
+  luma_smooth_gate_bias: -2.8
+  luma_smooth_gate_scale: 1.0
+
+data:
+  patch_size: 128
+  patches_per_image: 8
+  chunk_size: 4
+  exposure_jitter: [0.90, 1.15]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.04
+  gauss_sigma_max: 14.0
+  poisson_lambda_range: [45.0, 200.0]
+  jpeg_q_range: [95, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+weak_teacher:
+  enabled: true
+  pairs:
+    - noisy: /Users/uniuyuni/PythonProjects/test_photos/X-T5 Cat noisy.EXR
+      teacher: runs/perfect_nr/chroma_speckle/xt5_cat/xt5_cat_shadow_soft_chroma_speckle_xstrong.exr
+  patch_size: 128
+  patches_per_image: 360
+  batch_size: 1
+  exposure_jitter: [0.94, 1.08]
+  flip_rot: true
+  randomize_each_access: true
+  num_workers: 0
+  min_mask_mean: 0.06
+  detail_threshold: 0.014
+  detail_transition: 0.006
+  edge_threshold: 0.022
+  edge_transition: 0.008
+  highlight_threshold: 1.0
+  highlight_transition: 0.25
+  delta_threshold: 0.0010
+  delta_transition: 0.007
+  weight: 9.0
+  luma_weight: 0.01
+  chroma_weight: 0.25
+  luma_hf_weight: 0.04
+  chroma_hf_weight: 2.00
+  chroma_hf_tail_weight: 8.00
+  chroma_hf_tail_fraction: 0.018
+  hf_kernel_size: 9
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 600
+  warmup_iters: 50
+  lr: 3.5e-4
+  lr_min: 2.5e-5
+  weight_decay: 0.0
+  grad_clip: 0.40
+  ema_decay: 0.999
+  log_every: 25
+  save_every: 300
+  keep_last_ckpts: 4
+  init_checkpoint: runs/nagiperfect_perfect_s_weakteacher_chromahead_800/nagiperfect_perfect_s_weakteacher_chromahead_800_final.pt
+  init_state: state_dict
+  init_strict: true
+  freeze_for_chroma_branch: true
+  trainable_prefixes: ["chroma_smooth_head."]
+
+loss:
+  final_weight: 0.018
+  base_weight: 0.0
+  srgb_weight: 0.018
+  srgb_base_weight: 0.0
+  body_srgb_weight: 0.010
+  body_srgb_base_weight: 0.0
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.004
+  flat_luma_tail_weight: 0.010
+  flat_luma_tail_fraction: 0.018
+  flat_chroma_hf_weight: 0.0
+  flat_threshold: 0.012
+  flat_transition: 0.004
+  flat_kernel_size: 9
+  edge_luma_hf_weight: 0.050
+  edge_threshold: 0.036
+  edge_transition: 0.014
+  linear_weight: 0.001
+  highlight_luma_weight: 0.08
+  highlight_chroma_weight: 0.05
+  highlight_ratio_weight: 0.03
+  detail_weight: 0.040
+  confidence_l1_weight: 0.0
+  chroma_smooth_gate_l1_weight: 0.003
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3
