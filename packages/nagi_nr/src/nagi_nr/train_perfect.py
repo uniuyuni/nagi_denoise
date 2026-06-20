@@ -299,10 +299,16 @@ def main() -> None:
             delta_transition=float(weak_cfg.get("delta_transition", 0.010)),
             min_mask_mean=float(weak_cfg.get("min_mask_mean", 0.02)),
         )
+        weak_sampler = ChunkedShuffleSampler(
+            num_pairs=len(weak_ds.pairs),
+            patches_per_image=weak_ds.patches_per_image,
+            chunk_size=int(weak_cfg.get("chunk_size", weak_ds.patches_per_image)),
+            seed=args.seed + int(weak_cfg.get("seed_offset", 100000)),
+        )
         weak_dl = DataLoader(
             weak_ds,
             batch_size=int(weak_cfg.get("batch_size", cfg["train"]["batch_size"])),
-            shuffle=True,
+            sampler=weak_sampler,
             num_workers=int(weak_cfg.get("num_workers", 0)),
             drop_last=True,
             pin_memory=(device.type == "cuda"),
@@ -325,6 +331,7 @@ def main() -> None:
     ema_decay = float(train_cfg["ema_decay"])
     accum_steps = int(train_cfg.get("grad_accum_steps", 1))
     keep_last = int(train_cfg.get("keep_last_ckpts", 0))
+    skip_nonfinite = bool(train_cfg.get("skip_nonfinite", False))
     prefix = args.ckpt_prefix
 
     opt = AdamW(
@@ -463,6 +470,7 @@ def main() -> None:
             group["lr"] = cur_lr
         opt.zero_grad(set_to_none=True)
         accum_log: dict[str, float] = {}
+        bad_step = False
 
         for _ in range(accum_steps):
             try:
@@ -510,14 +518,35 @@ def main() -> None:
                 ):
                     losses[key] = weak_losses[key]
             if not torch.isfinite(losses["total"]).item():
+                bad_terms = []
+                for key, value in losses.items():
+                    finite = torch.isfinite(value).all().item()
+                    if not finite:
+                        bad_terms.append(key)
+                term_summary = " ".join(
+                    f"{key}={float(value.detach().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).mean().item()):.6g}"
+                    for key, value in losses.items()
+                )
                 msg = f"[fatal {step:7d}] non-finite loss detected; stopping before optimizer step/checkpoint"
+                if bad_terms:
+                    msg += f"; bad_terms={','.join(bad_terms)}"
                 print(msg)
+                print(f"[fatal {step:7d}] terms {term_summary}")
                 log_f.write(msg + "\n")
+                log_f.write(f"[fatal {step:7d}] terms {term_summary}\n")
+                if skip_nonfinite:
+                    opt.zero_grad(set_to_none=True)
+                    bad_step = True
+                    break
                 log_f.close()
                 raise FloatingPointError(msg)
             (losses["total"] / accum_steps).backward()
             for key, value in losses.items():
                 accum_log[key] = accum_log.get(key, 0.0) + float(value.detach().item()) / accum_steps
+
+        if bad_step:
+            step += 1
+            continue
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()

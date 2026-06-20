@@ -491,7 +491,9 @@ class WeakTeacherPatchDataset(Dataset):
         teacher_p = teacher[y : y + ps, x : x + ps]
 
         def _to_tensor_linear(arr: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).float()
+            safe = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+            safe = np.clip(safe, 0.0, None)
+            return torch.from_numpy(np.ascontiguousarray(safe)).permute(2, 0, 1).float()
 
         noisy_t = _to_tensor_linear(noisy_p)
         teacher_t = _to_tensor_linear(teacher_p)
