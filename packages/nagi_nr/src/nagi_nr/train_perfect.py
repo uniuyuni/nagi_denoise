@@ -422,16 +422,18 @@ def main() -> None:
             and getattr(model, "luma_smooth_head", None) is None
         ):
             raise ValueError("freeze_for_chroma_branch requires a chroma branch")
+        trainable_prefixes = train_cfg.get("trainable_prefixes")
+        if trainable_prefixes is None:
+            trainable_prefixes = ["chroma_head.", "chroma_smooth_head.", "luma_smooth_head."]
+        trainable_prefixes = tuple(str(prefix) for prefix in trainable_prefixes)
+        if not trainable_prefixes:
+            raise ValueError("trainable_prefixes must not be empty when freeze_for_chroma_branch is enabled")
         for name, param in model.named_parameters():
-            param.requires_grad_(
-                name.startswith("chroma_head.")
-                or name.startswith("chroma_smooth_head.")
-                or name.startswith("luma_smooth_head.")
-            )
+            param.requires_grad_(any(name.startswith(prefix) for prefix in trainable_prefixes))
         for name, param in ema.named_parameters():
             param.requires_grad_(False)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"freeze_for_chroma_branch: trainable params={trainable}")
+        print(f"freeze_for_chroma_branch: trainable prefixes={trainable_prefixes}, params={trainable}")
 
     log_path = out_dir / "train.log"
     log_f = open(log_path, "a", buffering=1, encoding="utf-8")
