@@ -98,6 +98,7 @@ def make_masks(
     flat_edge_threshold: float,
     min_display_luma: float,
     max_display_luma: float,
+    shadow_display_luma: float,
     highlight_linear_luma: float,
     edge_threshold: float,
     top_luma_percent: float,
@@ -109,11 +110,13 @@ def make_masks(
     midtone = (y_display >= min_display_luma) & (y_display <= max_display_luma)
     non_highlight = y_linear < highlight_linear_luma
     flat = (flat_hf < flat_hf_threshold) & (edge_mag < flat_edge_threshold) & midtone & non_highlight
+    shadow_flat = flat & (y_display <= float(shadow_display_luma))
     edge = (edge_mag >= edge_threshold) & midtone & non_highlight
     q = 1.0 - float(top_luma_percent) / 100.0
     top_luma = y_linear > float(np.quantile(y_linear, q))
     return {
         "flat": flat,
+        "shadow_flat": shadow_flat,
         "edge": edge,
         "highlight": top_luma,
         "midtone": midtone,
@@ -147,6 +150,7 @@ def candidate_metrics(
     hf_sigma: float,
 ) -> dict:
     flat = masks["flat"]
+    shadow_flat = masks.get("shadow_flat", flat)
     edge = masks["edge"]
     highlight = masks["highlight"]
 
@@ -183,12 +187,18 @@ def candidate_metrics(
     flat_magenta_dot_p99 = quantile_masked(out_magenta_dot_hf, flat, 0.99)
     ref_flat_magenta_dot_p95 = quantile_masked(ref_magenta_dot_hf, flat, 0.95)
     ref_flat_magenta_dot_p99 = quantile_masked(ref_magenta_dot_hf, flat, 0.99)
+    shadow_magenta_dot_p95 = quantile_masked(out_magenta_dot_hf, shadow_flat, 0.95)
+    shadow_magenta_dot_p99 = quantile_masked(out_magenta_dot_hf, shadow_flat, 0.99)
+    ref_shadow_magenta_dot_p95 = quantile_masked(ref_magenta_dot_hf, shadow_flat, 0.95)
+    ref_shadow_magenta_dot_p99 = quantile_masked(ref_magenta_dot_hf, shadow_flat, 0.99)
     flat_luma_visible = mean_masked(out_luma_hf * visibility_weight, flat)
     flat_chroma_visible = mean_masked(out_chroma_hf * visibility_weight, flat)
     flat_magenta_dot_visible = mean_masked(out_magenta_dot_hf * visibility_weight, flat)
+    shadow_magenta_dot_visible = mean_masked(out_magenta_dot_hf * visibility_weight, shadow_flat)
     ref_flat_luma_visible = mean_masked(ref_luma_hf * visibility_weight, flat)
     ref_flat_chroma_visible = mean_masked(ref_chroma_hf * visibility_weight, flat)
     ref_flat_magenta_dot_visible = mean_masked(ref_magenta_dot_hf * visibility_weight, flat)
+    ref_shadow_magenta_dot_visible = mean_masked(ref_magenta_dot_hf * visibility_weight, shadow_flat)
     edge_hf = mean_masked(out_edge_hf, edge)
     ref_edge = mean_masked(ref_edge_hf, edge)
 
@@ -227,6 +237,13 @@ def candidate_metrics(
         "reference_flat_magenta_dot_hf_p99": ref_flat_magenta_dot_p99,
         "flat_magenta_dot_hf_p99_ratio": safe_ratio(flat_magenta_dot_p99, ref_flat_magenta_dot_p99),
         "flat_magenta_dot_visible_ratio": safe_ratio(flat_magenta_dot_visible, ref_flat_magenta_dot_visible),
+        "shadow_magenta_dot_hf_p95": shadow_magenta_dot_p95,
+        "reference_shadow_magenta_dot_hf_p95": ref_shadow_magenta_dot_p95,
+        "shadow_magenta_dot_hf_p95_ratio": safe_ratio(shadow_magenta_dot_p95, ref_shadow_magenta_dot_p95),
+        "shadow_magenta_dot_hf_p99": shadow_magenta_dot_p99,
+        "reference_shadow_magenta_dot_hf_p99": ref_shadow_magenta_dot_p99,
+        "shadow_magenta_dot_hf_p99_ratio": safe_ratio(shadow_magenta_dot_p99, ref_shadow_magenta_dot_p99),
+        "shadow_magenta_dot_visible_ratio": safe_ratio(shadow_magenta_dot_visible, ref_shadow_magenta_dot_visible),
         "edge_luma_hf": edge_hf,
         "reference_edge_luma_hf": ref_edge,
         "edge_luma_hf_retention": safe_ratio(edge_hf, ref_edge),
@@ -275,6 +292,7 @@ def main() -> None:
     parser.add_argument("--edge-threshold", type=float, default=0.050)
     parser.add_argument("--min-display-luma", type=float, default=0.035)
     parser.add_argument("--max-display-luma", type=float, default=0.92)
+    parser.add_argument("--shadow-display-luma", type=float, default=0.22)
     parser.add_argument("--highlight-linear-luma", type=float, default=1.0)
     parser.add_argument("--top-luma-percent", type=float, default=1.0)
     args = parser.parse_args()
@@ -299,6 +317,7 @@ def main() -> None:
         flat_edge_threshold=args.flat_edge_threshold,
         min_display_luma=args.min_display_luma,
         max_display_luma=args.max_display_luma,
+        shadow_display_luma=args.shadow_display_luma,
         highlight_linear_luma=args.highlight_linear_luma,
         edge_threshold=args.edge_threshold,
         top_luma_percent=args.top_luma_percent,
@@ -320,6 +339,7 @@ def main() -> None:
             "edge_threshold": args.edge_threshold,
             "min_display_luma": args.min_display_luma,
             "max_display_luma": args.max_display_luma,
+            "shadow_display_luma": args.shadow_display_luma,
             "highlight_linear_luma": args.highlight_linear_luma,
             "top_luma_percent": args.top_luma_percent,
         },
@@ -377,7 +397,7 @@ def main() -> None:
         "| mask | fraction | pixels |",
         "| --- | ---: | ---: |",
     ]
-    for name in ("flat", "edge", "highlight"):
+    for name in ("flat", "shadow_flat", "edge", "highlight"):
         m = report["masks"][name]
         lines.append(f"| {name} | {m['fraction']:.6f} | {m['pixels']} |")
 
@@ -425,17 +445,19 @@ def main() -> None:
         "",
         "Magenta dot metrics:",
         "",
-        "| candidate | magenta dot p95 ratio | magenta dot p99 ratio | magenta dot visible ratio |",
-        "| --- | ---: | ---: | ---: |",
+        "| candidate | magenta dot p95 ratio | magenta dot p99 ratio | magenta dot visible ratio | shadow magenta p99 ratio | shadow magenta visible ratio |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in report["candidates"]:
         m = item["metrics"]
         lines.append(
-            "| {name} | {mp95:.3f} | {mp99:.3f} | {mv:.3f} |".format(
+            "| {name} | {mp95:.3f} | {mp99:.3f} | {mv:.3f} | {smp99:.3f} | {smv:.3f} |".format(
                 name=item["name"],
                 mp95=m["flat_magenta_dot_hf_p95_ratio"],
                 mp99=m["flat_magenta_dot_hf_p99_ratio"],
                 mv=m["flat_magenta_dot_visible_ratio"],
+                smp99=m["shadow_magenta_dot_hf_p99_ratio"],
+                smv=m["shadow_magenta_dot_visible_ratio"],
             )
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

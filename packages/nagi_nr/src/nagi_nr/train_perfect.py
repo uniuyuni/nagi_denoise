@@ -133,6 +133,9 @@ def weak_teacher_loss(
     chroma_axis_hf_weight: float,
     chroma_axis_hf_tail_weight: float,
     chroma_axis_hf_tail_fraction: float,
+    magenta_axis_hf_weight: float,
+    magenta_axis_hf_tail_weight: float,
+    magenta_axis_hf_tail_fraction: float,
     hf_kernel_size: int,
     charbonnier_eps: float,
 ) -> dict[str, torch.Tensor]:
@@ -210,6 +213,24 @@ def weak_teacher_loss(
         k = max(1, int(tail.shape[1] * fraction))
         chroma_axis_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
 
+    out_magenta = 0.5 * (output_srgb[:, 0:1] + output_srgb[:, 2:3]) - output_srgb[:, 1:2]
+    teacher_magenta = 0.5 * (teacher_srgb[:, 0:1] + teacher_srgb[:, 2:3]) - teacher_srgb[:, 1:2]
+    out_magenta_hf = out_magenta - _local_mean(out_magenta, hf_kernel_size)
+    teacher_magenta_hf = teacher_magenta - _local_mean(teacher_magenta, hf_kernel_size)
+    loss_magenta_axis_hf = _masked_charbonnier(
+        out_magenta_hf - teacher_magenta_hf,
+        mask,
+        charbonnier_eps=charbonnier_eps,
+    )
+    magenta_axis_hf_tail = torch.zeros((), dtype=output.dtype, device=output.device)
+    if magenta_axis_hf_tail_weight > 0.0:
+        tail = torch.sqrt((out_magenta_hf - teacher_magenta_hf).pow(2) + float(charbonnier_eps) ** 2)
+        tail = tail * mask
+        tail = tail.flatten(1)
+        fraction = max(min(float(magenta_axis_hf_tail_fraction), 1.0), 1.0e-6)
+        k = max(1, int(tail.shape[1] * fraction))
+        magenta_axis_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
+
     total = (
         float(luma_weight) * loss_luma
         + float(chroma_weight) * loss_chroma
@@ -219,6 +240,8 @@ def weak_teacher_loss(
         + float(chroma_hf_tail_weight) * chroma_hf_tail
         + float(chroma_axis_hf_weight) * loss_chroma_axis_hf
         + float(chroma_axis_hf_tail_weight) * chroma_axis_hf_tail
+        + float(magenta_axis_hf_weight) * loss_magenta_axis_hf
+        + float(magenta_axis_hf_tail_weight) * magenta_axis_hf_tail
     )
     return {
         "total": total,
@@ -230,6 +253,8 @@ def weak_teacher_loss(
         "weak_chroma_hf_tail": chroma_hf_tail.detach(),
         "weak_chroma_axis_hf": loss_chroma_axis_hf.detach(),
         "weak_chroma_axis_hf_tail": chroma_axis_hf_tail.detach(),
+        "weak_magenta_axis_hf": loss_magenta_axis_hf.detach(),
+        "weak_magenta_axis_hf_tail": magenta_axis_hf_tail.detach(),
         "weak_mask": mask.mean().detach(),
     }
 
@@ -554,6 +579,9 @@ def main() -> None:
                     chroma_axis_hf_weight=float(weak_cfg.get("chroma_axis_hf_weight", 0.0)),
                     chroma_axis_hf_tail_weight=float(weak_cfg.get("chroma_axis_hf_tail_weight", 0.0)),
                     chroma_axis_hf_tail_fraction=float(weak_cfg.get("chroma_axis_hf_tail_fraction", 0.02)),
+                    magenta_axis_hf_weight=float(weak_cfg.get("magenta_axis_hf_weight", 0.0)),
+                    magenta_axis_hf_tail_weight=float(weak_cfg.get("magenta_axis_hf_tail_weight", 0.0)),
+                    magenta_axis_hf_tail_fraction=float(weak_cfg.get("magenta_axis_hf_tail_fraction", 0.02)),
                     hf_kernel_size=int(weak_cfg.get("hf_kernel_size", 9)),
                     charbonnier_eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
                 )
@@ -568,6 +596,8 @@ def main() -> None:
                     "weak_chroma_hf_tail",
                     "weak_chroma_axis_hf",
                     "weak_chroma_axis_hf_tail",
+                    "weak_magenta_axis_hf",
+                    "weak_magenta_axis_hf_tail",
                     "weak_mask",
                 ):
                     losses[key] = weak_losses[key]
@@ -650,6 +680,8 @@ def main() -> None:
                 "weak_chroma_hf_tail",
                 "weak_chroma_axis_hf",
                 "weak_chroma_axis_hf_tail",
+                "weak_magenta_axis_hf",
+                "weak_magenta_axis_hf_tail",
                 "weak_mask",
             ):
                 if key in accum_log:

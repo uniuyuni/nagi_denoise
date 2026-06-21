@@ -116,6 +116,7 @@ train-nagiperfect-s-smoothgate-preserve-500 = "python scripts/launch_perfect_tra
 train-nagiperfect-s-strictflat-5k = "python scripts/launch_perfect_training.py perfect_s_strictflat_5k"
 train-nagiperfect-s-strictflat-2k = "python scripts/launch_perfect_training.py perfect_s_strictflat_2k"
 train-nagiperfect-s-hlguard-1k = "python scripts/launch_perfect_training.py perfect_s_hlguard_1k"
+train-nagiperfect-s-magentadot-2k = "python scripts/launch_perfect_training.py perfect_s_weakteacher_magentadot_2k"
 train-nagiperfect-s-pilot-500 = "python scripts/launch_perfect_training.py perfect_s_pilot_500"
 train-nagiperfect-s-stable-2k = "python scripts/launch_perfect_training.py perfect_s_stable_2k"
 denoise-nagiperfect-xt5-recommended = "python scripts/denoise_exr_nagiperfect.py --input /Users/uniuyuni/PythonProjects/platypus/SCUNet_CoreML/test_inputs/X-T5\\ Room.EXR --weights runs/nagiperfect_perfect_s_hlguard_1k/nagiperfect_perfect_s_hlguard_1k_final.pt --output-dir runs/perfect_nr/nagiperfect_exr/xt5_room_hlguard_final_inputguard_recommended --name xt5_room_hlguard_final_inputguard_recommended --device cpu --highlight-protect-threshold 1.0 --highlight-protect-transition 0.15 --highlight-protect-strength 0.85 --fast"
