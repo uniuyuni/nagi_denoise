@@ -140,8 +140,8 @@ def weak_teacher_loss(
     charbonnier_eps: float,
 ) -> dict[str, torch.Tensor]:
     output = pred["output"] if isinstance(pred, dict) else pred
-    output_srgb = linear_to_srgb(output)
-    teacher_srgb = linear_to_srgb(teacher)
+    output_srgb = linear_to_srgb(output.clamp_min(0.0))
+    teacher_srgb = linear_to_srgb(teacher.clamp_min(0.0))
     mask = mask.to(dtype=output.dtype).clamp(0.0, 1.0)
 
     out_y = _srgb_luma(output_srgb)
