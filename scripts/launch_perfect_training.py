@@ -12,6 +12,7 @@ VARIANTS = {
     "perfect_s_bodypush_4k": "packages/nagi_nr/configs/nagiperfect_s_bodypush_4k.yaml",
     "perfect_s_chromabranch2_1k": "packages/nagi_nr/configs/nagiperfect_s_chromabranch2_1k.yaml",
     "perfect_s_chromabranch_1k": "packages/nagi_nr/configs/nagiperfect_s_chromabranch_1k.yaml",
+    "perfect_s_chromacleanup_hdrsafe_1k": "packages/nagi_nr/configs/nagiperfect_s_chromacleanup_1k.yaml",
     "perfect_s_chromacleanup_1k": "packages/nagi_nr/configs/nagiperfect_s_chromacleanup_1k.yaml",
     "perfect_s_chromadistill3_1k": "packages/nagi_nr/configs/nagiperfect_s_chromadistill3_1k.yaml",
     "perfect_s_chromadistill2_1k": "packages/nagi_nr/configs/nagiperfect_s_chromadistill2_1k.yaml",

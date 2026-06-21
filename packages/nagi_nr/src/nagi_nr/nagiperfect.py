@@ -164,7 +164,9 @@ class NagiPerfect(nn.Module):
         chroma_smooth_gate_bias: float = -4.0,
         chroma_smooth_gate_scale: float = 1.0,
         chroma_cleanup_branch: bool = False,
+        chroma_cleanup_mode: str = "additive_chroma_delta",
         chroma_cleanup_strength: float = 0.12,
+        chroma_cleanup_kernel_size: int = 9,
         chroma_cleanup_width: int = 0,
         chroma_cleanup_blocks: int = 0,
         luma_smooth_branch: bool = False,
@@ -207,9 +209,13 @@ class NagiPerfect(nn.Module):
         self.chroma_smooth_gate_bias = float(chroma_smooth_gate_bias)
         self.chroma_smooth_gate_scale = float(chroma_smooth_gate_scale)
         self.chroma_cleanup_branch = bool(chroma_cleanup_branch)
+        self.chroma_cleanup_mode = str(chroma_cleanup_mode)
         self.chroma_cleanup_strength = float(chroma_cleanup_strength)
+        self.chroma_cleanup_kernel_size = int(chroma_cleanup_kernel_size)
         self.chroma_cleanup_width = int(chroma_cleanup_width)
         self.chroma_cleanup_blocks = int(chroma_cleanup_blocks)
+        if self.chroma_cleanup_mode not in {"additive_chroma_delta", "magenta_hf_shrink"}:
+            raise ValueError(f"unknown chroma_cleanup_mode: {self.chroma_cleanup_mode}")
         self.luma_smooth_branch = bool(luma_smooth_branch)
         self.luma_smooth_strength = float(luma_smooth_strength)
         self.luma_smooth_kernel_size = int(luma_smooth_kernel_size)
@@ -265,14 +271,15 @@ class NagiPerfect(nn.Module):
     def _build_chroma_cleanup_head(self, channels: int) -> nn.Module:
         branch_width = self.chroma_cleanup_width
         branch_blocks = self.chroma_cleanup_blocks
+        out_channels = 1 if self.chroma_cleanup_mode == "magenta_hf_shrink" else self.img_channels
         if branch_width <= 0 and branch_blocks <= 0:
-            return nn.Conv2d(int(channels), self.img_channels, 3, padding=1)
+            return nn.Conv2d(int(channels), out_channels, 3, padding=1)
 
         if branch_width <= 0:
             branch_width = max(8, min(int(channels), 24))
         layers: list[nn.Module] = [nn.Conv2d(int(channels), branch_width, 3, padding=1)]
         layers.extend(NagiPerfectBlock(branch_width) for _ in range(max(0, branch_blocks)))
-        layers.append(nn.Conv2d(branch_width, self.img_channels, 3, padding=1))
+        layers.append(nn.Conv2d(branch_width, out_channels, 3, padding=1))
         return nn.Sequential(*layers)
 
     def _init_weights(self) -> None:
@@ -320,7 +327,10 @@ class NagiPerfect(nn.Module):
             if isinstance(final_cleanup, nn.Sequential):
                 final_cleanup = final_cleanup[-1]
             if isinstance(final_cleanup, nn.Conv2d) and final_cleanup.bias is not None:
-                nn.init.zeros_(final_cleanup.bias)
+                if self.chroma_cleanup_mode == "magenta_hf_shrink":
+                    nn.init.constant_(final_cleanup.bias, -6.0)
+                else:
+                    nn.init.zeros_(final_cleanup.bias)
         if self.luma_smooth_head is not None and self.luma_smooth_head.bias is not None:
             nn.init.constant_(self.luma_smooth_head.bias, self.luma_smooth_gate_bias)
 
@@ -411,19 +421,31 @@ class NagiPerfect(nn.Module):
         output: torch.Tensor,
         cleanup_raw: torch.Tensor,
         gate: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.chroma_cleanup_strength <= 0.0:
-            return output, output.new_zeros(output.shape)
+            return output, output.new_zeros(output.shape), gate.new_zeros(gate.shape)
 
         output_nonneg = output.clamp_min(0.0)
         display = linear_to_srgb(output_nonneg)
-        y = srgb_luma(display)
-        chroma = display - y
-        cleanup = torch.tanh(cleanup_raw) * min(max(self.chroma_cleanup_strength, 0.0), 1.0)
-        cleanup = cleanup - srgb_luma(cleanup)
-        cleaned_display = (y + chroma + cleanup * gate).clamp(0.0, 1.0)
+        strength = min(max(self.chroma_cleanup_strength, 0.0), 1.0)
+        if self.chroma_cleanup_mode == "magenta_hf_shrink":
+            y = srgb_luma(display)
+            chroma = display - y
+            smooth_chroma = local_lowpass(chroma, self.chroma_cleanup_kernel_size)
+            chroma_hf = chroma - smooth_chroma
+            axis = display.new_tensor([1.0, -0.7035775, 1.0]).view(1, 3, 1, 1)
+            axis = axis / axis.square().sum().sqrt().clamp_min(1.0e-6)
+            magenta_hf = (chroma_hf * axis).sum(dim=1, keepdim=True) * axis
+            learned_gate = torch.sigmoid(cleanup_raw[:, :1]) * strength
+            effective_gate = learned_gate * gate
+            cleaned_display = (display - magenta_hf * effective_gate).clamp_min(0.0)
+        else:
+            cleanup = torch.tanh(cleanup_raw) * strength
+            cleanup = cleanup - srgb_luma(cleanup)
+            effective_gate = gate
+            cleaned_display = (display + cleanup * effective_gate).clamp_min(0.0)
         cleaned_linear = srgb_to_linear(cleaned_display).clamp_min(0.0)
-        return cleaned_linear, cleaned_linear - output_nonneg
+        return cleaned_linear, cleaned_linear - output_nonneg, effective_gate
 
     def forward(self, inp: torch.Tensor, return_aux: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
         h, w = inp.shape[-2:]
@@ -480,7 +502,7 @@ class NagiPerfect(nn.Module):
         if self.chroma_cleanup_head is not None:
             cleanup_raw = self.chroma_cleanup_head(feat)
             chroma_cleanup_gate = self._input_flat_chroma_gate(x)
-            output_pre_guard, chroma_cleanup_delta = self._apply_chroma_cleanup(
+            output_pre_guard, chroma_cleanup_delta, chroma_cleanup_gate = self._apply_chroma_cleanup(
                 output_pre_guard,
                 cleanup_raw,
                 chroma_cleanup_gate,

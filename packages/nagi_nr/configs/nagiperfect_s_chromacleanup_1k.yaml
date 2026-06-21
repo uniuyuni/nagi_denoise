@@ -3,9 +3,10 @@
 # Purpose:
 #   The previous magenta-dot experiments showed that chroma_smooth_head cannot
 #   absorb the d10 post process because it only gates a fixed lowpass target.
-#   This recipe adds a small learned display-chroma delta branch and trains only
-#   that branch. Luma losses are intentionally near zero: the branch is allowed
-#   to move color, not structure.
+#   This recipe trains a small learned gate that can only shrink display-chroma
+#   high-frequency energy on the magenta/green axis. Luma losses are
+#   intentionally near zero: the branch is allowed to clean color speckles, not
+#   structure.
 
 model:
   kind: nagiperfect
@@ -28,7 +29,9 @@ model:
   chroma_smooth_gate_bias: -2.4
   chroma_smooth_gate_scale: 1.0
   chroma_cleanup_branch: true
+  chroma_cleanup_mode: magenta_hf_shrink
   chroma_cleanup_strength: 0.18
+  chroma_cleanup_kernel_size: 9
   chroma_cleanup_width: 16
   chroma_cleanup_blocks: 1
   luma_smooth_branch: true
