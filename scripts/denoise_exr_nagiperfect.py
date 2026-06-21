@@ -31,7 +31,7 @@ POST_CHROMA_OVERSHRINK_PRESETS = {
 POST_LUMA_HF_PRESETS = {
     "off": None,
     "balanced": "xstrong",
-    "quality": "ultra",
+    "quality": "grain",
 }
 
 POST_CHROMA_SPECKLE_PRESETS = {
@@ -453,6 +453,13 @@ def main() -> None:
             detail_preserve_threshold=float(params["detail_preserve_threshold"]),
             detail_preserve_transition=float(params["detail_preserve_transition"]),
             shadow_boost=float(params["shadow_boost"]),
+            line_sigma=float(params["line_sigma"]),
+            line_smooth_sigma=float(params["line_smooth_sigma"]),
+            line_threshold=float(params["line_threshold"]),
+            line_transition=float(params["line_transition"]),
+            line_coherence_threshold=float(params["line_coherence_threshold"]),
+            line_coherence_transition=float(params["line_coherence_transition"]),
+            line_preserve_strength=float(params["line_preserve_strength"]),
             shadow_threshold=0.18,
             shadow_transition=0.08,
             structure_sigma=1.2,

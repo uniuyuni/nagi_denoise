@@ -27,6 +27,13 @@ PRESETS = {
         "detail_preserve_threshold": 0.020,
         "detail_preserve_transition": 0.010,
         "shadow_boost": 0.0,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.75,
     },
     "strong": {
         "strength": 0.68,
@@ -35,6 +42,13 @@ PRESETS = {
         "detail_preserve_threshold": 0.024,
         "detail_preserve_transition": 0.011,
         "shadow_boost": 0.0,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.82,
     },
     "xstrong": {
         "strength": 0.85,
@@ -43,6 +57,13 @@ PRESETS = {
         "detail_preserve_threshold": 0.028,
         "detail_preserve_transition": 0.012,
         "shadow_boost": 0.0,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.88,
     },
     "ultra": {
         "strength": 1.0,
@@ -51,6 +72,13 @@ PRESETS = {
         "detail_preserve_threshold": 0.040,
         "detail_preserve_transition": 0.016,
         "shadow_boost": 0.0,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.92,
     },
     "shadow": {
         "strength": 1.0,
@@ -59,6 +87,28 @@ PRESETS = {
         "detail_preserve_threshold": 0.043,
         "detail_preserve_transition": 0.018,
         "shadow_boost": 0.70,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.92,
+    },
+    "grain": {
+        "strength": 0.82,
+        "low_sigma": 1.00,
+        "shrink_threshold": 0.0070,
+        "detail_preserve_threshold": 0.027,
+        "detail_preserve_transition": 0.012,
+        "shadow_boost": 0.0,
+        "line_sigma": 0.70,
+        "line_smooth_sigma": 1.00,
+        "line_threshold": 0.010,
+        "line_transition": 0.006,
+        "line_coherence_threshold": 0.42,
+        "line_coherence_transition": 0.16,
+        "line_preserve_strength": 0.88,
     },
 }
 
@@ -103,6 +153,45 @@ def make_flat_gate(
     }
 
 
+def make_line_preserve_gate(
+    guide_rgb_linear: np.ndarray,
+    *,
+    line_sigma: float,
+    line_smooth_sigma: float,
+    line_threshold: float,
+    line_transition: float,
+    line_coherence_threshold: float,
+    line_coherence_transition: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    guide = np.nan_to_num(guide_rgb_linear[..., :3].astype(np.float32, copy=False), nan=0.0, posinf=1.0, neginf=0.0)
+    guide_display = np.clip(linear_to_srgb_np(guide), 0.0, 1.0)
+    guide_y = luma(guide_display, LUMA_SRGB)
+    sigma = float(line_sigma)
+    gx = gaussian_filter(guide_y, sigma=sigma, order=(0, 1), mode="reflect")
+    gy = gaussian_filter(guide_y, sigma=sigma, order=(1, 0), mode="reflect")
+    smooth_sigma = float(line_smooth_sigma)
+    jxx = gaussian_filter(gx * gx, sigma=smooth_sigma, mode="reflect")
+    jyy = gaussian_filter(gy * gy, sigma=smooth_sigma, mode="reflect")
+    jxy = gaussian_filter(gx * gy, sigma=smooth_sigma, mode="reflect")
+    energy = np.sqrt(np.maximum(jxx + jyy, 0.0))
+    coherence = np.sqrt((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy) / np.maximum(jxx + jyy, 1.0e-8)
+    energy_gate = sigmoid01((energy - float(line_threshold)) / max(float(line_transition), 1.0e-6))
+    coherence_gate = sigmoid01(
+        (coherence - float(line_coherence_threshold)) / max(float(line_coherence_transition), 1.0e-6)
+    )
+    line_gate = (energy_gate * coherence_gate).astype(np.float32, copy=False)
+    return line_gate, {
+        "line_energy_mean": float(np.mean(energy)),
+        "line_energy_p95": float(np.quantile(energy, 0.95)),
+        "line_energy_p99": float(np.quantile(energy, 0.99)),
+        "line_coherence_mean": float(np.mean(coherence)),
+        "line_coherence_p95": float(np.quantile(coherence, 0.95)),
+        "line_gate_mean": float(np.mean(line_gate)),
+        "line_gate_p90": float(np.quantile(line_gate, 0.90)),
+        "line_gate_p99": float(np.quantile(line_gate, 0.99)),
+    }
+
+
 def soft_shrink_highpass(
     high: np.ndarray,
     *,
@@ -122,6 +211,13 @@ def apply_luma_hf_shrink(
     detail_preserve_threshold: float,
     detail_preserve_transition: float,
     shadow_boost: float,
+    line_sigma: float,
+    line_smooth_sigma: float,
+    line_threshold: float,
+    line_transition: float,
+    line_coherence_threshold: float,
+    line_coherence_transition: float,
+    line_preserve_strength: float,
     shadow_threshold: float,
     shadow_transition: float,
     structure_sigma: float,
@@ -159,8 +255,18 @@ def apply_luma_hf_shrink(
     detail_preserve = sigmoid01(
         (high_abs - float(detail_preserve_threshold)) / max(float(detail_preserve_transition), 1.0e-6)
     )
+    line_gate, line_stats = make_line_preserve_gate(
+        guide_image,
+        line_sigma=line_sigma,
+        line_smooth_sigma=line_smooth_sigma,
+        line_threshold=line_threshold,
+        line_transition=line_transition,
+        line_coherence_threshold=line_coherence_threshold,
+        line_coherence_transition=line_coherence_transition,
+    )
     shadow_gate = sigmoid01((float(shadow_threshold) - y_low) / max(float(shadow_transition), 1.0e-6))
-    shrink_gate = np.clip(flat_gate * (1.0 - detail_preserve) * float(strength), 0.0, 1.0)
+    line_keep = 1.0 - np.clip(float(line_preserve_strength) * line_gate, 0.0, 1.0)
+    shrink_gate = np.clip(flat_gate * (1.0 - detail_preserve) * line_keep * float(strength), 0.0, 1.0)
     amount = shrink_gate * float(shrink_threshold) * (1.0 + float(shadow_boost) * shadow_gate)
     high_new = soft_shrink_highpass(high, amount=amount)
     out_y = np.clip(y_low + high_new, 0.0, 1.0)
@@ -186,6 +292,13 @@ def apply_luma_hf_shrink(
         "detail_preserve_threshold": float(detail_preserve_threshold),
         "detail_preserve_transition": float(detail_preserve_transition),
         "shadow_boost": float(shadow_boost),
+        "line_sigma": float(line_sigma),
+        "line_smooth_sigma": float(line_smooth_sigma),
+        "line_threshold": float(line_threshold),
+        "line_transition": float(line_transition),
+        "line_coherence_threshold": float(line_coherence_threshold),
+        "line_coherence_transition": float(line_coherence_transition),
+        "line_preserve_strength": float(line_preserve_strength),
         "shadow_threshold": float(shadow_threshold),
         "shadow_transition": float(shadow_transition),
         "shadow_gate_mean": float(np.mean(shadow_gate)),
@@ -199,6 +312,7 @@ def apply_luma_hf_shrink(
         "delta_abs_p99": float(np.quantile(np.abs(delta), 0.99)),
         "hdr_restore_mean": float(np.mean(hdr_restore)),
         "hdr_restore_p99": float(np.quantile(hdr_restore, 0.99)),
+        **line_stats,
         **gate_stats,
     }
     return out, stats, shrink_gate.astype(np.float32, copy=False)
@@ -217,6 +331,13 @@ def main() -> None:
     parser.add_argument("--detail-preserve-threshold", type=float, default=None)
     parser.add_argument("--detail-preserve-transition", type=float, default=None)
     parser.add_argument("--shadow-boost", type=float, default=None)
+    parser.add_argument("--line-sigma", type=float, default=None)
+    parser.add_argument("--line-smooth-sigma", type=float, default=None)
+    parser.add_argument("--line-threshold", type=float, default=None)
+    parser.add_argument("--line-transition", type=float, default=None)
+    parser.add_argument("--line-coherence-threshold", type=float, default=None)
+    parser.add_argument("--line-coherence-transition", type=float, default=None)
+    parser.add_argument("--line-preserve-strength", type=float, default=None)
     parser.add_argument("--shadow-threshold", type=float, default=0.18)
     parser.add_argument("--shadow-transition", type=float, default=0.08)
     parser.add_argument("--structure-sigma", type=float, default=1.2)
@@ -241,6 +362,13 @@ def main() -> None:
         ("detail_preserve_threshold", "detail_preserve_threshold"),
         ("detail_preserve_transition", "detail_preserve_transition"),
         ("shadow_boost", "shadow_boost"),
+        ("line_sigma", "line_sigma"),
+        ("line_smooth_sigma", "line_smooth_sigma"),
+        ("line_threshold", "line_threshold"),
+        ("line_transition", "line_transition"),
+        ("line_coherence_threshold", "line_coherence_threshold"),
+        ("line_coherence_transition", "line_coherence_transition"),
+        ("line_preserve_strength", "line_preserve_strength"),
     ):
         value = getattr(args, attr)
         if value is not None:
@@ -266,6 +394,13 @@ def main() -> None:
         detail_preserve_threshold=float(params["detail_preserve_threshold"]),
         detail_preserve_transition=float(params["detail_preserve_transition"]),
         shadow_boost=float(params["shadow_boost"]),
+        line_sigma=float(params["line_sigma"]),
+        line_smooth_sigma=float(params["line_smooth_sigma"]),
+        line_threshold=float(params["line_threshold"]),
+        line_transition=float(params["line_transition"]),
+        line_coherence_threshold=float(params["line_coherence_threshold"]),
+        line_coherence_transition=float(params["line_coherence_transition"]),
+        line_preserve_strength=float(params["line_preserve_strength"]),
         shadow_threshold=args.shadow_threshold,
         shadow_transition=args.shadow_transition,
         structure_sigma=args.structure_sigma,
