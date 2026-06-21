@@ -42,6 +42,45 @@ POST_CHROMA_SPECKLE_PRESETS = {
 }
 
 
+def apply_chroma_speckle_preset(
+    output: np.ndarray,
+    guide: np.ndarray,
+    preset_name: str | None,
+) -> tuple[np.ndarray, dict | None, np.ndarray | None]:
+    if preset_name is None:
+        return output, None, None
+    params = dict(CHROMA_SPECKLE_PRESETS[preset_name])
+    return apply_chroma_speckle_filter(
+        output,
+        guide,
+        strength=float(params["strength"]),
+        chroma_sigma=float(params["chroma_sigma"]),
+        median_size=int(params["median_size"]),
+        speckle_threshold=float(params["speckle_threshold"]),
+        speckle_transition=float(params["speckle_transition"]),
+        local_sigma=float(params["local_sigma"]),
+        local_gain=float(params["local_gain"]),
+        axis_boost=float(params["axis_boost"]),
+        axis_threshold=float(params["axis_threshold"]),
+        axis_transition=float(params["axis_transition"]),
+        magenta_boost=float(params["magenta_boost"]),
+        magenta_threshold=float(params["magenta_threshold"]),
+        magenta_transition=float(params["magenta_transition"]),
+        structure_sigma=1.2,
+        detail_sigma=2.8,
+        detail_threshold=0.018,
+        detail_transition=0.010,
+        edge_sigma=1.0,
+        edge_threshold=0.030,
+        edge_transition=0.015,
+        highlight_threshold=float(params["highlight_threshold"]),
+        highlight_transition=float(params["highlight_transition"]),
+        hdr_restore_peak_threshold=float(params["hdr_restore_peak_threshold"]),
+        hdr_restore_threshold=float(params["hdr_restore_threshold"]),
+        hdr_restore_transition=float(params["hdr_restore_transition"]),
+    )
+
+
 def linear_to_srgb_hdr(image: np.ndarray) -> np.ndarray:
     x = np.asarray(image, dtype=np.float32)
     is_low = x <= 0.0031308
@@ -343,6 +382,12 @@ def main() -> None:
         help="Post multi-axis display-chroma speckle guard preset.",
     )
     parser.add_argument(
+        "--post-final-chroma-speckle-preset",
+        choices=sorted(POST_CHROMA_SPECKLE_PRESETS),
+        default="off",
+        help="Final display-chroma speckle guard after luma cleanup.",
+    )
+    parser.add_argument(
         "--post-luma-hf-preset",
         choices=sorted(POST_LUMA_HF_PRESETS),
         default="off",
@@ -409,35 +454,8 @@ def main() -> None:
     post_chroma_speckle_blend = None
     post_chroma_speckle_source = POST_CHROMA_SPECKLE_PRESETS[args.post_chroma_speckle_preset]
     if post_chroma_speckle_source is not None:
-        params = dict(CHROMA_SPECKLE_PRESETS[post_chroma_speckle_source])
-        output, post_chroma_speckle_stats, post_chroma_speckle_blend = apply_chroma_speckle_filter(
-            output,
-            image,
-            strength=float(params["strength"]),
-            chroma_sigma=float(params["chroma_sigma"]),
-            median_size=int(params["median_size"]),
-            speckle_threshold=float(params["speckle_threshold"]),
-            speckle_transition=float(params["speckle_transition"]),
-            local_sigma=float(params["local_sigma"]),
-            local_gain=float(params["local_gain"]),
-            axis_boost=float(params["axis_boost"]),
-            axis_threshold=float(params["axis_threshold"]),
-            axis_transition=float(params["axis_transition"]),
-            magenta_boost=float(params["magenta_boost"]),
-            magenta_threshold=float(params["magenta_threshold"]),
-            magenta_transition=float(params["magenta_transition"]),
-            structure_sigma=1.2,
-            detail_sigma=2.8,
-            detail_threshold=0.018,
-            detail_transition=0.010,
-            edge_sigma=1.0,
-            edge_threshold=0.030,
-            edge_transition=0.015,
-            highlight_threshold=float(params["highlight_threshold"]),
-            highlight_transition=float(params["highlight_transition"]),
-            hdr_restore_peak_threshold=float(params["hdr_restore_peak_threshold"]),
-            hdr_restore_threshold=float(params["hdr_restore_threshold"]),
-            hdr_restore_transition=float(params["hdr_restore_transition"]),
+        output, post_chroma_speckle_stats, post_chroma_speckle_blend = apply_chroma_speckle_preset(
+            output, image, post_chroma_speckle_source
         )
     post_luma_hf_stats = None
     post_luma_hf_gate = None
@@ -475,6 +493,13 @@ def main() -> None:
             hdr_restore_threshold=0.85,
             hdr_restore_transition=0.25,
         )
+    post_final_chroma_speckle_stats = None
+    post_final_chroma_speckle_blend = None
+    post_final_chroma_speckle_source = POST_CHROMA_SPECKLE_PRESETS[args.post_final_chroma_speckle_preset]
+    if post_final_chroma_speckle_source is not None:
+        output, post_final_chroma_speckle_stats, post_final_chroma_speckle_blend = apply_chroma_speckle_preset(
+            output, image, post_final_chroma_speckle_source
+        )
 
     exr_path = out_dir / f"{name}_nagiperfect.exr"
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
@@ -484,6 +509,7 @@ def main() -> None:
     chroma_cleanup_gate_path = out_dir / f"{name}_chroma_cleanup_gate.png"
     luma_smooth_gate_path = out_dir / f"{name}_luma_smooth_gate.png"
     chroma_speckle_blend_path = out_dir / f"{name}_post_chroma_speckle_blend.png"
+    final_chroma_speckle_blend_path = out_dir / f"{name}_post_final_chroma_speckle_blend.png"
     luma_hf_gate_path = out_dir / f"{name}_post_luma_hf_gate.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
 
@@ -514,6 +540,10 @@ def main() -> None:
         Image.fromarray((np.clip(post_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
             chroma_speckle_blend_path
         )
+    if post_final_chroma_speckle_blend is not None:
+        Image.fromarray(
+            (np.clip(post_final_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        ).save(final_chroma_speckle_blend_path)
 
     meta = {
         "input": str(input_path),
@@ -529,6 +559,9 @@ def main() -> None:
             "chroma_cleanup_gate": str(chroma_cleanup_gate_path) if "chroma_cleanup_gate" in extras else None,
             "luma_smooth_gate": str(luma_smooth_gate_path) if "luma_smooth_gate" in extras else None,
             "post_chroma_speckle_blend": str(chroma_speckle_blend_path) if post_chroma_speckle_blend is not None else None,
+            "post_final_chroma_speckle_blend": str(final_chroma_speckle_blend_path)
+            if post_final_chroma_speckle_blend is not None
+            else None,
             "post_luma_hf_gate": str(luma_hf_gate_path) if post_luma_hf_gate is not None else None,
         },
         "input_stats": image_stats(image),
@@ -573,6 +606,11 @@ def main() -> None:
             "preset": args.post_chroma_speckle_preset,
             "source_preset": post_chroma_speckle_source,
             "stats": post_chroma_speckle_stats,
+        },
+        "post_final_chroma_speckle": {
+            "preset": args.post_final_chroma_speckle_preset,
+            "source_preset": post_final_chroma_speckle_source,
+            "stats": post_final_chroma_speckle_stats,
         },
         "tiling": {
             "tile_size": int(args.tile_size),
