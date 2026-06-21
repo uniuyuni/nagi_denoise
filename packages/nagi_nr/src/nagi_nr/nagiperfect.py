@@ -481,6 +481,7 @@ class NagiPerfect(nn.Module):
         chroma_cleanup_gate = None
         luma_smooth_gate = None
         luma_smooth_delta = None
+        output_pre_cleanup = None
         if self.chroma_head is not None:
             chroma_feat = feat
             if self.chroma_branch_use_input:
@@ -499,6 +500,15 @@ class NagiPerfect(nn.Module):
             )
             chroma_residual = chroma_smooth_delta if chroma_residual is None else chroma_residual + chroma_smooth_delta
             chroma_gate = chroma_smooth_gate if chroma_gate is None else torch.maximum(chroma_gate, chroma_smooth_gate)
+        if self.luma_smooth_head is not None:
+            luma_smooth_raw = self.luma_smooth_head(feat)
+            luma_smooth_gate = torch.sigmoid(luma_smooth_raw * self.luma_smooth_gate_scale)
+            luma_smooth_gate = luma_smooth_gate * self._input_flat_chroma_gate(x)
+            output_pre_guard, luma_smooth_delta = self._apply_luma_smoothing(
+                output_pre_guard,
+                luma_smooth_gate,
+            )
+        output_pre_cleanup = output_pre_guard
         if self.chroma_cleanup_head is not None:
             cleanup_raw = self.chroma_cleanup_head(feat)
             chroma_cleanup_gate = self._input_flat_chroma_gate(x)
@@ -509,14 +519,6 @@ class NagiPerfect(nn.Module):
             )
             chroma_residual = chroma_cleanup_delta if chroma_residual is None else chroma_residual + chroma_cleanup_delta
             chroma_gate = chroma_cleanup_gate if chroma_gate is None else torch.maximum(chroma_gate, chroma_cleanup_gate)
-        if self.luma_smooth_head is not None:
-            luma_smooth_raw = self.luma_smooth_head(feat)
-            luma_smooth_gate = torch.sigmoid(luma_smooth_raw * self.luma_smooth_gate_scale)
-            luma_smooth_gate = luma_smooth_gate * self._input_flat_chroma_gate(x)
-            output_pre_guard, luma_smooth_delta = self._apply_luma_smoothing(
-                output_pre_guard,
-                luma_smooth_gate,
-            )
         output, highlight_guard = input_highlight_guard(
             output_pre_guard,
             x,
@@ -532,6 +534,7 @@ class NagiPerfect(nn.Module):
             "output": output,
             "output_pre_guard": output_pre_guard[..., :h, :w],
             "output_pre_chroma": output_pre_chroma[..., :h, :w],
+            "output_pre_cleanup": output_pre_cleanup[..., :h, :w],
             "base": base[..., :h, :w],
             "detail": detail[..., :h, :w],
             "detail_confidence": confidence[..., :h, :w],

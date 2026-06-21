@@ -142,6 +142,9 @@ def weak_teacher_loss(
     magenta_axis_hf_weight: float,
     magenta_axis_hf_tail_weight: float,
     magenta_axis_hf_tail_fraction: float,
+    baseline_luma_weight: float,
+    baseline_chroma_weight: float,
+    baseline_chroma_hf_weight: float,
     hf_kernel_size: int,
     charbonnier_eps: float,
 ) -> dict[str, torch.Tensor]:
@@ -237,6 +240,31 @@ def weak_teacher_loss(
         k = max(1, int(tail.shape[1] * fraction))
         magenta_axis_hf_tail = tail.topk(k, dim=1, largest=True).values.mean()
 
+    baseline_luma = torch.zeros((), dtype=output.dtype, device=output.device)
+    baseline_chroma = torch.zeros((), dtype=output.dtype, device=output.device)
+    baseline_chroma_hf = torch.zeros((), dtype=output.dtype, device=output.device)
+    if isinstance(pred, dict) and "output_pre_cleanup" in pred:
+        baseline = pred["output_pre_cleanup"].detach()
+        baseline_srgb = linear_to_srgb(baseline.clamp_min(0.0))
+        baseline_y = _srgb_luma(baseline_srgb)
+        baseline_luma = _masked_charbonnier(
+            out_y - baseline_y,
+            mask,
+            charbonnier_eps=charbonnier_eps,
+        )
+        baseline_chroma_value = baseline_srgb - baseline_y
+        baseline_chroma = _masked_charbonnier(
+            out_chroma - baseline_chroma_value,
+            mask,
+            charbonnier_eps=charbonnier_eps,
+        )
+        baseline_chroma_hf_value = baseline_chroma_value - _local_mean(baseline_chroma_value, hf_kernel_size)
+        baseline_chroma_hf = _masked_charbonnier(
+            out_chroma_hf - baseline_chroma_hf_value,
+            mask,
+            charbonnier_eps=charbonnier_eps,
+        )
+
     total = (
         float(luma_weight) * loss_luma
         + float(chroma_weight) * loss_chroma
@@ -248,6 +276,9 @@ def weak_teacher_loss(
         + float(chroma_axis_hf_tail_weight) * chroma_axis_hf_tail
         + float(magenta_axis_hf_weight) * loss_magenta_axis_hf
         + float(magenta_axis_hf_tail_weight) * magenta_axis_hf_tail
+        + float(baseline_luma_weight) * baseline_luma
+        + float(baseline_chroma_weight) * baseline_chroma
+        + float(baseline_chroma_hf_weight) * baseline_chroma_hf
     )
     return {
         "total": total,
@@ -261,6 +292,9 @@ def weak_teacher_loss(
         "weak_chroma_axis_hf_tail": chroma_axis_hf_tail.detach(),
         "weak_magenta_axis_hf": loss_magenta_axis_hf.detach(),
         "weak_magenta_axis_hf_tail": magenta_axis_hf_tail.detach(),
+        "weak_baseline_luma": baseline_luma.detach(),
+        "weak_baseline_chroma": baseline_chroma.detach(),
+        "weak_baseline_chroma_hf": baseline_chroma_hf.detach(),
         "weak_mask": mask.mean().detach(),
     }
 
@@ -589,6 +623,9 @@ def main() -> None:
                     magenta_axis_hf_weight=float(weak_cfg.get("magenta_axis_hf_weight", 0.0)),
                     magenta_axis_hf_tail_weight=float(weak_cfg.get("magenta_axis_hf_tail_weight", 0.0)),
                     magenta_axis_hf_tail_fraction=float(weak_cfg.get("magenta_axis_hf_tail_fraction", 0.02)),
+                    baseline_luma_weight=float(weak_cfg.get("baseline_luma_weight", 0.0)),
+                    baseline_chroma_weight=float(weak_cfg.get("baseline_chroma_weight", 0.0)),
+                    baseline_chroma_hf_weight=float(weak_cfg.get("baseline_chroma_hf_weight", 0.0)),
                     hf_kernel_size=int(weak_cfg.get("hf_kernel_size", 9)),
                     charbonnier_eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
                 )
@@ -605,6 +642,9 @@ def main() -> None:
                     "weak_chroma_axis_hf_tail",
                     "weak_magenta_axis_hf",
                     "weak_magenta_axis_hf_tail",
+                    "weak_baseline_luma",
+                    "weak_baseline_chroma",
+                    "weak_baseline_chroma_hf",
                     "weak_mask",
                 ):
                     losses[key] = weak_losses[key]
@@ -689,6 +729,9 @@ def main() -> None:
                 "weak_chroma_axis_hf_tail",
                 "weak_magenta_axis_hf",
                 "weak_magenta_axis_hf_tail",
+                "weak_baseline_luma",
+                "weak_baseline_chroma",
+                "weak_baseline_chroma_hf",
                 "weak_mask",
             ):
                 if key in accum_log:
