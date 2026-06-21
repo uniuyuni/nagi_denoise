@@ -68,6 +68,10 @@ def build_model(cfg: dict) -> NagiPerfect:
                 "chroma_smooth_kernel_size": model.chroma_smooth_kernel_size,
                 "chroma_smooth_gate_bias": model.chroma_smooth_gate_bias,
                 "chroma_smooth_gate_scale": model.chroma_smooth_gate_scale,
+                "chroma_cleanup_branch": model.chroma_cleanup_branch,
+                "chroma_cleanup_strength": model.chroma_cleanup_strength,
+                "chroma_cleanup_width": model.chroma_cleanup_width,
+                "chroma_cleanup_blocks": model.chroma_cleanup_blocks,
                 "luma_smooth_branch": model.luma_smooth_branch,
                 "luma_smooth_strength": model.luma_smooth_strength,
                 "luma_smooth_kernel_size": model.luma_smooth_kernel_size,
@@ -509,12 +513,13 @@ def main() -> None:
         if (
             getattr(model, "chroma_head", None) is None
             and getattr(model, "chroma_smooth_head", None) is None
+            and getattr(model, "chroma_cleanup_head", None) is None
             and getattr(model, "luma_smooth_head", None) is None
         ):
             raise ValueError("freeze_for_chroma_branch requires a chroma branch")
         trainable_prefixes = train_cfg.get("trainable_prefixes")
         if trainable_prefixes is None:
-            trainable_prefixes = ["chroma_head.", "chroma_smooth_head.", "luma_smooth_head."]
+            trainable_prefixes = ["chroma_head.", "chroma_smooth_head.", "chroma_cleanup_head.", "luma_smooth_head."]
         trainable_prefixes = tuple(str(prefix) for prefix in trainable_prefixes)
         if not trainable_prefixes:
             raise ValueError("trainable_prefixes must not be empty when freeze_for_chroma_branch is enabled")

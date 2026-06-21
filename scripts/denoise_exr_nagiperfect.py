@@ -111,6 +111,10 @@ def load_model(weights: Path, device: torch.device, state_key: str) -> NagiPerfe
                 "chroma_smooth_kernel_size": model.chroma_smooth_kernel_size,
                 "chroma_smooth_gate_bias": model.chroma_smooth_gate_bias,
                 "chroma_smooth_gate_scale": model.chroma_smooth_gate_scale,
+                "chroma_cleanup_branch": model.chroma_cleanup_branch,
+                "chroma_cleanup_strength": model.chroma_cleanup_strength,
+                "chroma_cleanup_width": model.chroma_cleanup_width,
+                "chroma_cleanup_blocks": model.chroma_cleanup_blocks,
                 "luma_smooth_branch": model.luma_smooth_branch,
                 "luma_smooth_strength": model.luma_smooth_strength,
                 "luma_smooth_kernel_size": model.luma_smooth_kernel_size,
@@ -146,6 +150,8 @@ def run_full_image(model: NagiPerfect, image: np.ndarray, device: torch.device) 
     for key in ("chroma_smooth_gate", "luma_smooth_gate"):
         if key in aux:
             extras[key] = aux[key].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
+    if "chroma_cleanup_gate" in aux:
+        extras["chroma_cleanup_gate"] = aux["chroma_cleanup_gate"].squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
     return out, extras
 
 
@@ -240,6 +246,8 @@ def run_tiled_image(
     } if diagnostics else {}
     if diagnostics and getattr(model, "chroma_smooth_branch", False):
         extras_accum["chroma_smooth_gate"] = np.zeros((h, w), dtype=np.float32)
+    if diagnostics and getattr(model, "chroma_cleanup_branch", False):
+        extras_accum["chroma_cleanup_gate"] = np.zeros((h, w), dtype=np.float32)
     if diagnostics and getattr(model, "luma_smooth_branch", False):
         extras_accum["luma_smooth_gate"] = np.zeros((h, w), dtype=np.float32)
     total = len(y_starts) * len(x_starts)
@@ -415,6 +423,7 @@ def main() -> None:
     preview_path = out_dir / f"{name}_nagiperfect_preview.png"
     confidence_path = out_dir / f"{name}_detail_confidence.png"
     chroma_smooth_gate_path = out_dir / f"{name}_chroma_smooth_gate.png"
+    chroma_cleanup_gate_path = out_dir / f"{name}_chroma_cleanup_gate.png"
     luma_smooth_gate_path = out_dir / f"{name}_luma_smooth_gate.png"
     luma_hf_gate_path = out_dir / f"{name}_post_luma_hf_gate.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
@@ -429,6 +438,10 @@ def main() -> None:
     if "chroma_smooth_gate" in extras:
         Image.fromarray((np.clip(extras["chroma_smooth_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
             chroma_smooth_gate_path
+        )
+    if "chroma_cleanup_gate" in extras:
+        Image.fromarray((np.clip(extras["chroma_cleanup_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            chroma_cleanup_gate_path
         )
     if "luma_smooth_gate" in extras:
         Image.fromarray((np.clip(extras["luma_smooth_gate"], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
@@ -450,6 +463,7 @@ def main() -> None:
             "preview": str(preview_path),
             "detail_confidence": str(confidence_path) if "detail_confidence" in extras else None,
             "chroma_smooth_gate": str(chroma_smooth_gate_path) if "chroma_smooth_gate" in extras else None,
+            "chroma_cleanup_gate": str(chroma_cleanup_gate_path) if "chroma_cleanup_gate" in extras else None,
             "luma_smooth_gate": str(luma_smooth_gate_path) if "luma_smooth_gate" in extras else None,
             "post_luma_hf_gate": str(luma_hf_gate_path) if post_luma_hf_gate is not None else None,
         },
@@ -472,6 +486,12 @@ def main() -> None:
             "post_overshrink_strength": post_chroma_overshrink_strength,
             "post_overshrink_kernel_size": int(args.post_chroma_overshrink_kernel_size),
         },
+        "chroma_cleanup": {
+            "enabled": bool(getattr(model, "chroma_cleanup_branch", False)),
+            "strength": float(getattr(model, "chroma_cleanup_strength", 0.0)),
+            "width": int(getattr(model, "chroma_cleanup_width", 0)),
+            "blocks": int(getattr(model, "chroma_cleanup_blocks", 0)),
+        },
         "luma_smooth": {
             "enabled": bool(getattr(model, "luma_smooth_branch", False)),
             "strength": float(getattr(model, "luma_smooth_strength", 0.0)),
@@ -493,7 +513,7 @@ def main() -> None:
         meta["detail_confidence_mean"] = float(np.mean(extras["detail_confidence"]))
     if "detail_applied" in extras:
         meta["detail_applied_abs_mean"] = float(np.mean(np.abs(extras["detail_applied"])))
-    for key in ("chroma_smooth_gate", "luma_smooth_gate"):
+    for key in ("chroma_smooth_gate", "chroma_cleanup_gate", "luma_smooth_gate"):
         if key in extras:
             meta[key] = {
                 "mean": float(np.mean(extras[key])),

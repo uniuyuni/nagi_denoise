@@ -1,0 +1,145 @@
+# NagiPerfect-S chroma-cleanup branch distillation.
+#
+# Purpose:
+#   The previous magenta-dot experiments showed that chroma_smooth_head cannot
+#   absorb the d10 post process because it only gates a fixed lowpass target.
+#   This recipe adds a small learned display-chroma delta branch and trains only
+#   that branch. Luma losses are intentionally near zero: the branch is allowed
+#   to move color, not structure.
+
+model:
+  kind: nagiperfect
+  preset: perfect-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+  chroma_gate_threshold: 0.018
+  chroma_gate_transition: 0.014
+  chroma_gate_kernel_size: 9
+  chroma_gate_highlight_threshold: 1.0
+  chroma_gate_highlight_transition: 0.2
+  chroma_gate_strength: 1.0
+  chroma_smooth_branch: true
+  chroma_smooth_strength: 1.0
+  chroma_smooth_kernel_size: 9
+  chroma_smooth_gate_bias: -2.4
+  chroma_smooth_gate_scale: 1.0
+  chroma_cleanup_branch: true
+  chroma_cleanup_strength: 0.18
+  chroma_cleanup_width: 16
+  chroma_cleanup_blocks: 1
+  luma_smooth_branch: true
+  luma_smooth_strength: 0.50
+  luma_smooth_kernel_size: 5
+  luma_smooth_gate_bias: -2.8
+  luma_smooth_gate_scale: 1.0
+
+data:
+  patch_size: 128
+  patches_per_image: 2
+  chunk_size: 2
+  exposure_jitter: [1.0, 1.0]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.0
+  gauss_sigma_max: 0.0
+  poisson_lambda_range: [100.0, 100.0]
+  jpeg_q_range: [100, 100]
+  max_pairs: 4
+  num_workers: 0
+
+weak_teacher:
+  enabled: true
+  pairs:
+    - noisy: /Users/uniuyuni/PythonProjects/test_photos/X-T5 Cat noisy.EXR
+      teacher: runs/perfect_nr/magenta_dot/xt5_cat_d10_hard_chroma/xt5_cat_magenta_dot_d10_hard_chroma.exr
+    - noisy: /Users/uniuyuni/PythonProjects/test_photos/X-T5 Hydrangea.EXR
+      teacher: runs/perfect_nr/guard_pipeline/xt5_hydrangea_residual_51500_safety_sweep/xt5_hydrangea_residual_luma_51500_safety200.exr
+    - noisy: /Users/uniuyuni/PythonProjects/test_photos/X-T5 Room.EXR
+      teacher: runs/perfect_nr/guard_pipeline/xt5_room_residual_quality_preset/xt5_room_residual_quality_preset.exr
+  patch_size: 128
+  patches_per_image: 720
+  chunk_size: 24
+  batch_size: 1
+  exposure_jitter: [0.96, 1.04]
+  flip_rot: true
+  randomize_each_access: true
+  num_workers: 0
+  min_mask_mean: 0.04
+  detail_threshold: 0.026
+  detail_transition: 0.014
+  edge_threshold: 0.040
+  edge_transition: 0.018
+  highlight_threshold: 1.0
+  highlight_transition: 0.25
+  delta_threshold: 0.0004
+  delta_transition: 0.004
+  weight: 1.0
+  luma_weight: 0.0
+  chroma_weight: 0.35
+  luma_hf_weight: 0.0
+  luma_hf_tail_weight: 0.0
+  luma_hf_tail_fraction: 0.010
+  chroma_hf_weight: 2.50
+  chroma_hf_tail_weight: 5.00
+  chroma_hf_tail_fraction: 0.010
+  chroma_axis_hf_weight: 5.00
+  chroma_axis_hf_tail_weight: 14.00
+  chroma_axis_hf_tail_fraction: 0.010
+  magenta_axis_hf_weight: 8.00
+  magenta_axis_hf_tail_weight: 28.00
+  magenta_axis_hf_tail_fraction: 0.012
+  hf_kernel_size: 7
+
+train:
+  batch_size: 1
+  grad_accum_steps: 2
+  total_iters: 1000
+  warmup_iters: 40
+  lr: 1.0e-4
+  lr_min: 1.5e-5
+  weight_decay: 0.0
+  grad_clip: 0.12
+  ema_decay: 0.999
+  skip_nonfinite: true
+  log_every: 25
+  save_every: 500
+  keep_last_ckpts: 4
+  init_checkpoint: runs/nagiperfect_perfect_s_weakteacher_chromaaxis_4k/nagiperfect_perfect_s_weakteacher_chromaaxis_4k_final.pt
+  init_state: state_dict
+  init_strict: false
+  freeze_for_chroma_branch: true
+  trainable_prefixes: ["chroma_cleanup_head."]
+
+loss:
+  final_weight: 0.0
+  base_weight: 0.0
+  srgb_weight: 0.0
+  srgb_base_weight: 0.0
+  body_srgb_weight: 0.0
+  body_srgb_base_weight: 0.0
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.0
+  flat_luma_tail_weight: 0.0
+  flat_chroma_hf_weight: 0.0
+  flat_threshold: 0.011
+  flat_transition: 0.004
+  flat_kernel_size: 7
+  edge_luma_hf_weight: 0.0
+  edge_threshold: 0.034
+  edge_transition: 0.014
+  linear_weight: 0.0
+  highlight_luma_weight: 0.0
+  highlight_chroma_weight: 0.0
+  highlight_ratio_weight: 0.0
+  detail_weight: 0.0
+  confidence_l1_weight: 0.0
+  chroma_smooth_gate_l1_weight: 0.0
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

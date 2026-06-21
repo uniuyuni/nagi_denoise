@@ -163,6 +163,10 @@ class NagiPerfect(nn.Module):
         chroma_smooth_kernel_size: int = 9,
         chroma_smooth_gate_bias: float = -4.0,
         chroma_smooth_gate_scale: float = 1.0,
+        chroma_cleanup_branch: bool = False,
+        chroma_cleanup_strength: float = 0.12,
+        chroma_cleanup_width: int = 0,
+        chroma_cleanup_blocks: int = 0,
         luma_smooth_branch: bool = False,
         luma_smooth_strength: float = 0.4,
         luma_smooth_kernel_size: int = 5,
@@ -202,6 +206,10 @@ class NagiPerfect(nn.Module):
         self.chroma_smooth_kernel_size = int(chroma_smooth_kernel_size)
         self.chroma_smooth_gate_bias = float(chroma_smooth_gate_bias)
         self.chroma_smooth_gate_scale = float(chroma_smooth_gate_scale)
+        self.chroma_cleanup_branch = bool(chroma_cleanup_branch)
+        self.chroma_cleanup_strength = float(chroma_cleanup_strength)
+        self.chroma_cleanup_width = int(chroma_cleanup_width)
+        self.chroma_cleanup_blocks = int(chroma_cleanup_blocks)
         self.luma_smooth_branch = bool(luma_smooth_branch)
         self.luma_smooth_strength = float(luma_smooth_strength)
         self.luma_smooth_kernel_size = int(luma_smooth_kernel_size)
@@ -233,6 +241,7 @@ class NagiPerfect(nn.Module):
         self.confidence_head = nn.Conv2d(channels, 1, 3, padding=1)
         self.chroma_head = self._build_chroma_head(channels) if self.chroma_branch else None
         self.chroma_smooth_head = nn.Conv2d(channels, 1, 3, padding=1) if self.chroma_smooth_branch else None
+        self.chroma_cleanup_head = self._build_chroma_cleanup_head(channels) if self.chroma_cleanup_branch else None
         self.luma_smooth_head = nn.Conv2d(channels, 1, 3, padding=1) if self.luma_smooth_branch else None
         self._confidence_bias = float(confidence_bias)
         self._init_weights()
@@ -249,6 +258,19 @@ class NagiPerfect(nn.Module):
         layers: list[nn.Module] = [
             nn.Conv2d(in_channels, branch_width, 3, padding=1),
         ]
+        layers.extend(NagiPerfectBlock(branch_width) for _ in range(max(0, branch_blocks)))
+        layers.append(nn.Conv2d(branch_width, self.img_channels, 3, padding=1))
+        return nn.Sequential(*layers)
+
+    def _build_chroma_cleanup_head(self, channels: int) -> nn.Module:
+        branch_width = self.chroma_cleanup_width
+        branch_blocks = self.chroma_cleanup_blocks
+        if branch_width <= 0 and branch_blocks <= 0:
+            return nn.Conv2d(int(channels), self.img_channels, 3, padding=1)
+
+        if branch_width <= 0:
+            branch_width = max(8, min(int(channels), 24))
+        layers: list[nn.Module] = [nn.Conv2d(int(channels), branch_width, 3, padding=1)]
         layers.extend(NagiPerfectBlock(branch_width) for _ in range(max(0, branch_blocks)))
         layers.append(nn.Conv2d(branch_width, self.img_channels, 3, padding=1))
         return nn.Sequential(*layers)
@@ -271,6 +293,12 @@ class NagiPerfect(nn.Module):
                 nn.init.zeros_(final_chroma.weight)
         if self.chroma_smooth_head is not None:
             nn.init.zeros_(self.chroma_smooth_head.weight)
+        if self.chroma_cleanup_head is not None:
+            final_cleanup = self.chroma_cleanup_head
+            if isinstance(final_cleanup, nn.Sequential):
+                final_cleanup = final_cleanup[-1]
+            if isinstance(final_cleanup, nn.Conv2d):
+                nn.init.zeros_(final_cleanup.weight)
         if self.luma_smooth_head is not None:
             nn.init.zeros_(self.luma_smooth_head.weight)
         if self.base_head.bias is not None:
@@ -287,6 +315,12 @@ class NagiPerfect(nn.Module):
                 nn.init.zeros_(final_chroma.bias)
         if self.chroma_smooth_head is not None and self.chroma_smooth_head.bias is not None:
             nn.init.constant_(self.chroma_smooth_head.bias, self.chroma_smooth_gate_bias)
+        if self.chroma_cleanup_head is not None:
+            final_cleanup = self.chroma_cleanup_head
+            if isinstance(final_cleanup, nn.Sequential):
+                final_cleanup = final_cleanup[-1]
+            if isinstance(final_cleanup, nn.Conv2d) and final_cleanup.bias is not None:
+                nn.init.zeros_(final_cleanup.bias)
         if self.luma_smooth_head is not None and self.luma_smooth_head.bias is not None:
             nn.init.constant_(self.luma_smooth_head.bias, self.luma_smooth_gate_bias)
 
@@ -306,7 +340,7 @@ class NagiPerfect(nn.Module):
 
     def _input_flat_chroma_gate(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            not (self.chroma_branch or self.chroma_smooth_branch or self.luma_smooth_branch)
+            not (self.chroma_branch or self.chroma_smooth_branch or self.chroma_cleanup_branch or self.luma_smooth_branch)
             or self.chroma_gate_strength <= 0.0
         ):
             return x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
@@ -372,6 +406,25 @@ class NagiPerfect(nn.Module):
         smoothed_linear = srgb_to_linear(smoothed_display.clamp_min(0.0)).clamp_min(0.0)
         return smoothed_linear, smoothed_linear - output_nonneg
 
+    def _apply_chroma_cleanup(
+        self,
+        output: torch.Tensor,
+        cleanup_raw: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.chroma_cleanup_strength <= 0.0:
+            return output, output.new_zeros(output.shape)
+
+        output_nonneg = output.clamp_min(0.0)
+        display = linear_to_srgb(output_nonneg)
+        y = srgb_luma(display)
+        chroma = display - y
+        cleanup = torch.tanh(cleanup_raw) * min(max(self.chroma_cleanup_strength, 0.0), 1.0)
+        cleanup = cleanup - srgb_luma(cleanup)
+        cleaned_display = (y + chroma + cleanup * gate).clamp(0.0, 1.0)
+        cleaned_linear = srgb_to_linear(cleaned_display).clamp_min(0.0)
+        return cleaned_linear, cleaned_linear - output_nonneg
+
     def forward(self, inp: torch.Tensor, return_aux: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
         h, w = inp.shape[-2:]
         x, _, _ = self._pad(inp)
@@ -402,6 +455,8 @@ class NagiPerfect(nn.Module):
         chroma_gate = None
         chroma_smooth_gate = None
         chroma_smooth_delta = None
+        chroma_cleanup_delta = None
+        chroma_cleanup_gate = None
         luma_smooth_gate = None
         luma_smooth_delta = None
         if self.chroma_head is not None:
@@ -422,6 +477,16 @@ class NagiPerfect(nn.Module):
             )
             chroma_residual = chroma_smooth_delta if chroma_residual is None else chroma_residual + chroma_smooth_delta
             chroma_gate = chroma_smooth_gate if chroma_gate is None else torch.maximum(chroma_gate, chroma_smooth_gate)
+        if self.chroma_cleanup_head is not None:
+            cleanup_raw = self.chroma_cleanup_head(feat)
+            chroma_cleanup_gate = self._input_flat_chroma_gate(x)
+            output_pre_guard, chroma_cleanup_delta = self._apply_chroma_cleanup(
+                output_pre_guard,
+                cleanup_raw,
+                chroma_cleanup_gate,
+            )
+            chroma_residual = chroma_cleanup_delta if chroma_residual is None else chroma_residual + chroma_cleanup_delta
+            chroma_gate = chroma_cleanup_gate if chroma_gate is None else torch.maximum(chroma_gate, chroma_cleanup_gate)
         if self.luma_smooth_head is not None:
             luma_smooth_raw = self.luma_smooth_head(feat)
             luma_smooth_gate = torch.sigmoid(luma_smooth_raw * self.luma_smooth_gate_scale)
@@ -463,6 +528,13 @@ class NagiPerfect(nn.Module):
                 {
                     "chroma_smooth_gate": chroma_smooth_gate[..., :h, :w],
                     "chroma_smooth_delta": chroma_smooth_delta[..., :h, :w],
+                }
+            )
+        if chroma_cleanup_gate is not None and chroma_cleanup_delta is not None:
+            aux.update(
+                {
+                    "chroma_cleanup_gate": chroma_cleanup_gate[..., :h, :w],
+                    "chroma_cleanup_delta": chroma_cleanup_delta[..., :h, :w],
                 }
             )
         if luma_smooth_gate is not None and luma_smooth_delta is not None:

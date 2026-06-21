@@ -102,6 +102,7 @@ train-nagiperfect-s-basepush-2k = "python scripts/launch_perfect_training.py per
 train-nagiperfect-s-bodypush-4k = "python scripts/launch_perfect_training.py perfect_s_bodypush_4k"
 train-nagiperfect-s-chromabranch2-1k = "python scripts/launch_perfect_training.py perfect_s_chromabranch2_1k"
 train-nagiperfect-s-chromabranch-1k = "python scripts/launch_perfect_training.py perfect_s_chromabranch_1k"
+train-nagiperfect-s-chromacleanup-1k = "python scripts/launch_perfect_training.py perfect_s_chromacleanup_1k"
 train-nagiperfect-s-chromadistill3-1k = "python scripts/launch_perfect_training.py perfect_s_chromadistill3_1k"
 train-nagiperfect-s-chromadistill2-1k = "python scripts/launch_perfect_training.py perfect_s_chromadistill2_1k"
 train-nagiperfect-s-chromadistill-1k = "python scripts/launch_perfect_training.py perfect_s_chromadistill_1k"
