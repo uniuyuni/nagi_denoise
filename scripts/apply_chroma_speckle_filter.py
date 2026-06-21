@@ -22,31 +22,84 @@ from perfect_nr_probe import image_stats, make_preview, read_image
 
 PRESETS = {
     "mild": {
-        "strength": 0.55,
-        "chroma_sigma": 1.4,
+        "strength": 0.40,
+        "chroma_sigma": 1.9,
         "median_size": 3,
-        "speckle_threshold": 0.020,
-        "speckle_transition": 0.010,
-        "local_gain": 0.65,
-        "magenta_boost": 0.40,
+        "speckle_threshold": 0.018,
+        "speckle_transition": 0.009,
+        "local_sigma": 1.8,
+        "local_gain": 0.45,
+        "axis_boost": 0.20,
+        "axis_threshold": 0.014,
+        "axis_transition": 0.007,
+        "magenta_boost": 0.25,
+        "magenta_threshold": 0.018,
+        "magenta_transition": 0.012,
+        "highlight_threshold": 0.50,
+        "highlight_transition": 0.12,
+        "hdr_restore_peak_threshold": 0.58,
+        "hdr_restore_threshold": 0.45,
+        "hdr_restore_transition": 0.12,
     },
     "strong": {
-        "strength": 0.75,
-        "chroma_sigma": 1.8,
+        "strength": 0.52,
+        "chroma_sigma": 1.9,
         "median_size": 3,
-        "speckle_threshold": 0.016,
-        "speckle_transition": 0.008,
-        "local_gain": 0.50,
-        "magenta_boost": 0.65,
+        "speckle_threshold": 0.014,
+        "speckle_transition": 0.007,
+        "local_sigma": 1.8,
+        "local_gain": 0.45,
+        "axis_boost": 0.25,
+        "axis_threshold": 0.014,
+        "axis_transition": 0.007,
+        "magenta_boost": 0.30,
+        "magenta_threshold": 0.018,
+        "magenta_transition": 0.012,
+        "highlight_threshold": 0.55,
+        "highlight_transition": 0.14,
+        "hdr_restore_peak_threshold": 0.62,
+        "hdr_restore_threshold": 0.50,
+        "hdr_restore_transition": 0.14,
     },
     "xstrong": {
-        "strength": 0.92,
-        "chroma_sigma": 2.2,
+        "strength": 0.70,
+        "chroma_sigma": 1.9,
         "median_size": 3,
-        "speckle_threshold": 0.013,
-        "speckle_transition": 0.006,
-        "local_gain": 0.35,
-        "magenta_boost": 0.85,
+        "speckle_threshold": 0.014,
+        "speckle_transition": 0.007,
+        "local_sigma": 1.8,
+        "local_gain": 0.45,
+        "axis_boost": 0.45,
+        "axis_threshold": 0.014,
+        "axis_transition": 0.007,
+        "magenta_boost": 0.45,
+        "magenta_threshold": 0.018,
+        "magenta_transition": 0.012,
+        "highlight_threshold": 0.70,
+        "highlight_transition": 0.18,
+        "hdr_restore_peak_threshold": 0.75,
+        "hdr_restore_threshold": 0.65,
+        "hdr_restore_transition": 0.18,
+    },
+    "quality": {
+        "strength": 0.52,
+        "chroma_sigma": 1.9,
+        "median_size": 3,
+        "speckle_threshold": 0.014,
+        "speckle_transition": 0.007,
+        "local_sigma": 1.8,
+        "local_gain": 0.45,
+        "axis_boost": 0.25,
+        "axis_threshold": 0.014,
+        "axis_transition": 0.007,
+        "magenta_boost": 0.30,
+        "magenta_threshold": 0.018,
+        "magenta_transition": 0.012,
+        "highlight_threshold": 0.55,
+        "highlight_transition": 0.14,
+        "hdr_restore_peak_threshold": 0.62,
+        "hdr_restore_threshold": 0.50,
+        "hdr_restore_transition": 0.14,
     },
 }
 
@@ -62,6 +115,9 @@ def apply_chroma_speckle_filter(
     speckle_transition: float,
     local_sigma: float,
     local_gain: float,
+    axis_boost: float,
+    axis_threshold: float,
+    axis_transition: float,
     magenta_boost: float,
     magenta_threshold: float,
     magenta_transition: float,
@@ -109,9 +165,26 @@ def apply_chroma_speckle_filter(
     adaptive_threshold = float(speckle_threshold) + float(local_gain) * local_mag
     speckle_gate = sigmoid01((residual_mag - adaptive_threshold) / max(float(speckle_transition), 1.0e-6))
 
+    residual_r = residual[..., 0]
+    residual_g = residual[..., 1]
+    residual_b = residual[..., 2]
+    magenta_axis = 0.5 * (residual_r + residual_b) - residual_g
+    red_axis = residual_r - 0.5 * (residual_g + residual_b)
+    blue_axis = residual_b - 0.5 * (residual_r + residual_g)
+    axis_signal = np.maximum.reduce(
+        (
+            np.abs(magenta_axis),
+            np.abs(red_axis),
+            np.abs(blue_axis),
+            np.abs(residual_r - residual_g),
+            np.abs(residual_b - 0.5 * (residual_r + residual_g)),
+        )
+    )
+    axis_gate = sigmoid01((axis_signal - float(axis_threshold)) / max(float(axis_transition), 1.0e-6))
+
     magenta_signal = 0.5 * (display[..., 0] + display[..., 2]) - display[..., 1]
     magenta_gate = sigmoid01((magenta_signal - float(magenta_threshold)) / max(float(magenta_transition), 1.0e-6))
-    boost = 1.0 + float(magenta_boost) * magenta_gate
+    boost = 1.0 + float(axis_boost) * axis_gate + float(magenta_boost) * magenta_gate
     blend = np.clip(flat_gate * speckle_gate * boost * float(strength), 0.0, 1.0).astype(np.float32, copy=False)
 
     out_chroma = chroma * (1.0 - blend[..., None]) + target_chroma * blend[..., None]
@@ -135,12 +208,20 @@ def apply_chroma_speckle_filter(
         "speckle_transition": float(speckle_transition),
         "local_sigma": float(local_sigma),
         "local_gain": float(local_gain),
+        "axis_boost": float(axis_boost),
+        "axis_threshold": float(axis_threshold),
+        "axis_transition": float(axis_transition),
         "magenta_boost": float(magenta_boost),
         "magenta_threshold": float(magenta_threshold),
         "magenta_transition": float(magenta_transition),
         "residual_mag_mean": float(np.mean(residual_mag)),
         "residual_mag_p95": float(np.quantile(residual_mag, 0.95)),
         "residual_mag_p99": float(np.quantile(residual_mag, 0.99)),
+        "axis_signal_p95": float(np.quantile(axis_signal, 0.95)),
+        "axis_signal_p99": float(np.quantile(axis_signal, 0.99)),
+        "axis_gate_mean": float(np.mean(axis_gate)),
+        "axis_gate_p90": float(np.quantile(axis_gate, 0.90)),
+        "axis_gate_p99": float(np.quantile(axis_gate, 0.99)),
         "speckle_gate_mean": float(np.mean(speckle_gate)),
         "speckle_gate_p90": float(np.quantile(speckle_gate, 0.90)),
         "speckle_gate_p99": float(np.quantile(speckle_gate, 0.99)),
@@ -168,11 +249,14 @@ def main() -> None:
     parser.add_argument("--median-size", type=int, default=None)
     parser.add_argument("--speckle-threshold", type=float, default=None)
     parser.add_argument("--speckle-transition", type=float, default=None)
-    parser.add_argument("--local-sigma", type=float, default=1.8)
+    parser.add_argument("--local-sigma", type=float, default=None)
     parser.add_argument("--local-gain", type=float, default=None)
+    parser.add_argument("--axis-boost", type=float, default=None)
+    parser.add_argument("--axis-threshold", type=float, default=None)
+    parser.add_argument("--axis-transition", type=float, default=None)
     parser.add_argument("--magenta-boost", type=float, default=None)
-    parser.add_argument("--magenta-threshold", type=float, default=0.018)
-    parser.add_argument("--magenta-transition", type=float, default=0.012)
+    parser.add_argument("--magenta-threshold", type=float, default=None)
+    parser.add_argument("--magenta-transition", type=float, default=None)
     parser.add_argument("--structure-sigma", type=float, default=1.2)
     parser.add_argument("--detail-sigma", type=float, default=2.8)
     parser.add_argument("--detail-threshold", type=float, default=0.018)
@@ -180,11 +264,11 @@ def main() -> None:
     parser.add_argument("--edge-sigma", type=float, default=1.0)
     parser.add_argument("--edge-threshold", type=float, default=0.030)
     parser.add_argument("--edge-transition", type=float, default=0.015)
-    parser.add_argument("--highlight-threshold", type=float, default=1.0)
-    parser.add_argument("--highlight-transition", type=float, default=0.25)
-    parser.add_argument("--hdr-restore-peak-threshold", type=float, default=0.95)
-    parser.add_argument("--hdr-restore-threshold", type=float, default=0.85)
-    parser.add_argument("--hdr-restore-transition", type=float, default=0.25)
+    parser.add_argument("--highlight-threshold", type=float, default=None)
+    parser.add_argument("--highlight-transition", type=float, default=None)
+    parser.add_argument("--hdr-restore-peak-threshold", type=float, default=None)
+    parser.add_argument("--hdr-restore-threshold", type=float, default=None)
+    parser.add_argument("--hdr-restore-transition", type=float, default=None)
     args = parser.parse_args()
 
     params = dict(PRESETS[args.preset])
@@ -194,8 +278,19 @@ def main() -> None:
         ("median_size", "median_size"),
         ("speckle_threshold", "speckle_threshold"),
         ("speckle_transition", "speckle_transition"),
+        ("local_sigma", "local_sigma"),
         ("local_gain", "local_gain"),
+        ("axis_boost", "axis_boost"),
+        ("axis_threshold", "axis_threshold"),
+        ("axis_transition", "axis_transition"),
         ("magenta_boost", "magenta_boost"),
+        ("magenta_threshold", "magenta_threshold"),
+        ("magenta_transition", "magenta_transition"),
+        ("highlight_threshold", "highlight_threshold"),
+        ("highlight_transition", "highlight_transition"),
+        ("hdr_restore_peak_threshold", "hdr_restore_peak_threshold"),
+        ("hdr_restore_threshold", "hdr_restore_threshold"),
+        ("hdr_restore_transition", "hdr_restore_transition"),
     ):
         value = getattr(args, attr)
         if value is not None:
@@ -220,11 +315,14 @@ def main() -> None:
         median_size=int(params["median_size"]),
         speckle_threshold=float(params["speckle_threshold"]),
         speckle_transition=float(params["speckle_transition"]),
-        local_sigma=args.local_sigma,
+        local_sigma=float(params["local_sigma"]),
         local_gain=float(params["local_gain"]),
+        axis_boost=float(params["axis_boost"]),
+        axis_threshold=float(params["axis_threshold"]),
+        axis_transition=float(params["axis_transition"]),
         magenta_boost=float(params["magenta_boost"]),
-        magenta_threshold=args.magenta_threshold,
-        magenta_transition=args.magenta_transition,
+        magenta_threshold=float(params["magenta_threshold"]),
+        magenta_transition=float(params["magenta_transition"]),
         structure_sigma=args.structure_sigma,
         detail_sigma=args.detail_sigma,
         detail_threshold=args.detail_threshold,
@@ -232,11 +330,11 @@ def main() -> None:
         edge_sigma=args.edge_sigma,
         edge_threshold=args.edge_threshold,
         edge_transition=args.edge_transition,
-        highlight_threshold=args.highlight_threshold,
-        highlight_transition=args.highlight_transition,
-        hdr_restore_peak_threshold=args.hdr_restore_peak_threshold,
-        hdr_restore_threshold=args.hdr_restore_threshold,
-        hdr_restore_transition=args.hdr_restore_transition,
+        highlight_threshold=float(params["highlight_threshold"]),
+        highlight_transition=float(params["highlight_transition"]),
+        hdr_restore_peak_threshold=float(params["hdr_restore_peak_threshold"]),
+        hdr_restore_threshold=float(params["hdr_restore_threshold"]),
+        hdr_restore_transition=float(params["hdr_restore_transition"]),
     )
 
     exr_path = out_dir / f"{name}.exr"
