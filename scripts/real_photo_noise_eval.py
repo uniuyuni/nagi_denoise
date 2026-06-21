@@ -69,6 +69,12 @@ def chroma_hf_energy(rgb_display: np.ndarray, sigma: float) -> np.ndarray:
     return np.sqrt(0.5 * (rg_hf * rg_hf + by_hf * by_hf))
 
 
+def magenta_dot_hf_energy(rgb_display: np.ndarray, sigma: float) -> np.ndarray:
+    rgb = _safe_rgb(rgb_display)
+    magenta_axis = 0.5 * (rgb[..., 0] + rgb[..., 2]) - rgb[..., 1]
+    return np.maximum(highpass(magenta_axis, sigma), 0.0)
+
+
 def luma_hf_energy(rgb_display: np.ndarray, sigma: float) -> np.ndarray:
     y = luma(rgb_display, LUMA_SRGB)
     return np.abs(highpass(y, sigma))
@@ -148,6 +154,8 @@ def candidate_metrics(
     out_luma_hf = luma_hf_energy(candidate_display, hf_sigma)
     ref_chroma_hf = chroma_hf_energy(reference_display, hf_sigma)
     out_chroma_hf = chroma_hf_energy(candidate_display, hf_sigma)
+    ref_magenta_dot_hf = magenta_dot_hf_energy(reference_display, hf_sigma)
+    out_magenta_dot_hf = magenta_dot_hf_energy(candidate_display, hf_sigma)
     y_display = luma(reference_display, LUMA_SRGB)
     visibility_weight = 1.0 / np.sqrt(np.maximum(y_display, 0.02))
 
@@ -171,10 +179,16 @@ def candidate_metrics(
     ref_flat_luma_p99 = quantile_masked(ref_luma_hf, flat, 0.99)
     ref_flat_chroma_p95 = quantile_masked(ref_chroma_hf, flat, 0.95)
     ref_flat_chroma_p99 = quantile_masked(ref_chroma_hf, flat, 0.99)
+    flat_magenta_dot_p95 = quantile_masked(out_magenta_dot_hf, flat, 0.95)
+    flat_magenta_dot_p99 = quantile_masked(out_magenta_dot_hf, flat, 0.99)
+    ref_flat_magenta_dot_p95 = quantile_masked(ref_magenta_dot_hf, flat, 0.95)
+    ref_flat_magenta_dot_p99 = quantile_masked(ref_magenta_dot_hf, flat, 0.99)
     flat_luma_visible = mean_masked(out_luma_hf * visibility_weight, flat)
     flat_chroma_visible = mean_masked(out_chroma_hf * visibility_weight, flat)
+    flat_magenta_dot_visible = mean_masked(out_magenta_dot_hf * visibility_weight, flat)
     ref_flat_luma_visible = mean_masked(ref_luma_hf * visibility_weight, flat)
     ref_flat_chroma_visible = mean_masked(ref_chroma_hf * visibility_weight, flat)
+    ref_flat_magenta_dot_visible = mean_masked(ref_magenta_dot_hf * visibility_weight, flat)
     edge_hf = mean_masked(out_edge_hf, edge)
     ref_edge = mean_masked(ref_edge_hf, edge)
 
@@ -206,6 +220,13 @@ def candidate_metrics(
         "reference_flat_chroma_hf_p99": ref_flat_chroma_p99,
         "flat_chroma_hf_p99_ratio": safe_ratio(flat_chroma_p99, ref_flat_chroma_p99),
         "flat_chroma_visible_ratio": safe_ratio(flat_chroma_visible, ref_flat_chroma_visible),
+        "flat_magenta_dot_hf_p95": flat_magenta_dot_p95,
+        "reference_flat_magenta_dot_hf_p95": ref_flat_magenta_dot_p95,
+        "flat_magenta_dot_hf_p95_ratio": safe_ratio(flat_magenta_dot_p95, ref_flat_magenta_dot_p95),
+        "flat_magenta_dot_hf_p99": flat_magenta_dot_p99,
+        "reference_flat_magenta_dot_hf_p99": ref_flat_magenta_dot_p99,
+        "flat_magenta_dot_hf_p99_ratio": safe_ratio(flat_magenta_dot_p99, ref_flat_magenta_dot_p99),
+        "flat_magenta_dot_visible_ratio": safe_ratio(flat_magenta_dot_visible, ref_flat_magenta_dot_visible),
         "edge_luma_hf": edge_hf,
         "reference_edge_luma_hf": ref_edge,
         "edge_luma_hf_retention": safe_ratio(edge_hf, ref_edge),
@@ -398,6 +419,23 @@ def main() -> None:
                 cp95=m["flat_chroma_hf_p95_ratio"],
                 cp99=m["flat_chroma_hf_p99_ratio"],
                 cv=m["flat_chroma_visible_ratio"],
+            )
+        )
+    lines += [
+        "",
+        "Magenta dot metrics:",
+        "",
+        "| candidate | magenta dot p95 ratio | magenta dot p99 ratio | magenta dot visible ratio |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for item in report["candidates"]:
+        m = item["metrics"]
+        lines.append(
+            "| {name} | {mp95:.3f} | {mp99:.3f} | {mv:.3f} |".format(
+                name=item["name"],
+                mp95=m["flat_magenta_dot_hf_p95_ratio"],
+                mp99=m["flat_magenta_dot_hf_p99_ratio"],
+                mv=m["flat_magenta_dot_visible_ratio"],
             )
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
