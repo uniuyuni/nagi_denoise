@@ -64,6 +64,7 @@ SCENES: tuple[SceneSpec, ...] = (
         teacher_offset_xy=(1808, 556),
     ),
 )
+SCENE_BY_NAME = {scene.name: scene for scene in SCENES}
 
 
 ROI_TOP_LEFT: dict[str, list[tuple[str, int, int]]] = {
@@ -117,6 +118,13 @@ def detail_map(x: np.ndarray, sigma: float = 1.0) -> np.ndarray:
     return np.abs(y - gaussian_filter(y, sigma=float(sigma), mode="reflect")).astype(np.float32)
 
 
+def chroma_hf_map(img: np.ndarray, sigma: float = 1.2) -> np.ndarray:
+    y = luma(img)[..., None]
+    chroma = _safe_rgb(img) - y
+    hf = chroma - gaussian_filter(chroma, sigma=(float(sigma), float(sigma), 0.0), mode="reflect")
+    return np.sqrt(np.sum(hf * hf, axis=2)).astype(np.float32)
+
+
 def match_teacher_low_frequency(current: np.ndarray, teacher: np.ndarray, sigma: float = 28.0) -> np.ndarray:
     """Keep Nagi's local tone/color and borrow only PL's local residual texture.
 
@@ -150,6 +158,9 @@ def build_crops(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir)
     crop_dir = out_dir / "crops"
     crop_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean:
+        for old in crop_dir.glob("*.npz"):
+            old.unlink()
     rng = random.Random(args.seed)
     written: list[dict] = []
 
@@ -178,6 +189,8 @@ def build_crops(args: argparse.Namespace) -> None:
             edge = np.clip(np.maximum(d_current, d_teacher) / 0.030, 0.0, 1.0).astype(np.float32)
             delta = np.linalg.norm(t - c, axis=2).astype(np.float32)
             useful = np.clip(delta / 0.060, 0.0, 1.0)
+            chroma_noise = np.maximum(chroma_hf_map(c), chroma_hf_map(n))
+            noise_gate = np.clip((chroma_noise - 0.010) / 0.035, 0.0, 1.0).astype(np.float32)
             weak = np.clip(flat * useful, 0.0, 1.0).astype(np.float32)
 
             stem = f"{spec.name}_{label}_x{x}_y{y}"
@@ -190,6 +203,7 @@ def build_crops(args: argparse.Namespace) -> None:
                 teacher_raw=t_raw.astype(np.float16),
                 weak=weak.astype(np.float16),
                 protect=edge.astype(np.float16),
+                noise_gate=noise_gate.astype(np.float16),
                 scene=spec.name,
                 label=label,
                 x=np.int32(x),
@@ -204,6 +218,7 @@ def build_crops(args: argparse.Namespace) -> None:
                     "y": y,
                     "weak_mean": float(np.mean(weak)),
                     "protect_mean": float(np.mean(edge)),
+                    "noise_gate_mean": float(np.mean(noise_gate)),
                     "teacher_delta_mean": float(np.mean(delta)),
                     "teacher_raw_delta_mean": float(np.mean(np.linalg.norm(t_raw - c, axis=2))),
                 }
@@ -282,6 +297,7 @@ class CropDataset(torch.utils.data.Dataset):
             "teacher": take("teacher", True),
             "weak": take("weak", False),
             "protect": take("protect", False),
+            "noise_gate": take("noise_gate", False) if "noise_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
         }
 
 
@@ -293,6 +309,18 @@ def choose_device(name: str) -> torch.device:
             return torch.device("cuda")
         return torch.device("cpu")
     return torch.device(name)
+
+
+def load_model(checkpoint: str | Path, device: torch.device) -> PilotRefiner:
+    try:
+        ckpt = torch.load(checkpoint, map_location="cpu")
+    except pickle.UnpicklingError:
+        # Backward compatibility for the first pilot checkpoint, which stored
+        # argparse's subcommand function object in args.
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    model = PilotRefiner(width=int(ckpt["width"]), blocks=int(ckpt["blocks"]), max_delta=float(ckpt["max_delta"]))
+    model.load_state_dict(ckpt["model"])
+    return model.to(device).eval()
 
 
 def train(args: argparse.Namespace) -> None:
@@ -318,9 +346,10 @@ def train(args: argparse.Namespace) -> None:
             teacher = batch["teacher"].to(device)
             weak = batch["weak"].to(device)
             protect = batch["protect"].to(device)
+            noise_gate = batch["noise_gate"].to(device)
             pred = model(make_features(noisy, current), current)
 
-            weak_w = 0.08 + weak * args.weak_weight
+            weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight)
             protect_w = protect * args.protect_weight
             loss_teacher = (torch.abs(pred - teacher) * weak_w).mean()
             loss_identity = (torch.abs(pred - current) * (protect_w + args.identity_weight)).mean()
@@ -378,16 +407,8 @@ def total_variation(x: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def apply_crops(args: argparse.Namespace) -> None:
-    try:
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
-    except pickle.UnpicklingError:
-        # Backward compatibility for the first pilot checkpoint, which stored
-        # argparse's subcommand function object in args.
-        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     device = choose_device(args.device)
-    model = PilotRefiner(width=int(ckpt["width"]), blocks=int(ckpt["blocks"]), max_delta=float(ckpt["max_delta"]))
-    model.load_state_dict(ckpt["model"])
-    model.to(device).eval()
+    model = load_model(args.checkpoint, device)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = sorted(Path(args.crop_dir).glob("*.npz"))
@@ -407,6 +428,130 @@ def apply_crops(args: argparse.Namespace) -> None:
         write_tiff(out_dir / f"{stem}_refined.tiff", srgb_to_linear(out))
     make_contact_sheets(rows, out_dir, max_rows=args.max_rows)
     print(f"wrote refined crops and contact sheets to {out_dir}")
+
+
+def tile_starts(length: int, tile: int, overlap: int) -> list[int]:
+    if length <= tile:
+        return [0]
+    step = max(1, tile - overlap)
+    starts = list(range(0, max(1, length - tile + 1), step))
+    last = length - tile
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def tile_weight(height: int, width: int, top: int, left: int, full_h: int, full_w: int, overlap: int) -> np.ndarray:
+    wy = np.ones((height,), dtype=np.float32)
+    wx = np.ones((width,), dtype=np.float32)
+    ramp_y = min(int(overlap), height // 2)
+    ramp_x = min(int(overlap), width // 2)
+    if ramp_y > 0 and top > 0:
+        wy[:ramp_y] *= np.linspace(0.02, 1.0, ramp_y, dtype=np.float32)
+    if ramp_y > 0 and top + height < full_h:
+        wy[-ramp_y:] *= np.linspace(1.0, 0.02, ramp_y, dtype=np.float32)
+    if ramp_x > 0 and left > 0:
+        wx[:ramp_x] *= np.linspace(0.02, 1.0, ramp_x, dtype=np.float32)
+    if ramp_x > 0 and left + width < full_w:
+        wx[-ramp_x:] *= np.linspace(1.0, 0.02, ramp_x, dtype=np.float32)
+    return (wy[:, None] * wx[None, :])[..., None]
+
+
+def chroma_hf_p99(img: np.ndarray) -> float:
+    y = luma(img)[..., None]
+    chroma = _safe_rgb(img) - y
+    hf = chroma - gaussian_filter(chroma, sigma=(1.2, 1.2, 0.0), mode="reflect")
+    return float(np.quantile(np.sqrt(np.sum(hf * hf, axis=2)), 0.99))
+
+
+def luma_hf_p99(img: np.ndarray) -> float:
+    y = luma(img)
+    hf = y - gaussian_filter(y, sigma=1.2, mode="reflect")
+    return float(np.quantile(np.abs(hf), 0.99))
+
+
+@torch.no_grad()
+def apply_full(args: argparse.Namespace) -> None:
+    spec = SCENE_BY_NAME.get(args.scene) if args.scene else None
+    noisy_path = Path(args.noisy or (spec.noisy if spec else ""))
+    current_path = Path(args.current or (spec.current if spec else ""))
+    if not noisy_path or not current_path:
+        raise ValueError("--scene or both --noisy/--current are required")
+
+    device = choose_device(args.device)
+    model = load_model(args.checkpoint, device)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = args.name or (args.scene or current_path.stem.replace(" ", "_"))
+
+    print(f"reading noisy: {noisy_path}")
+    noisy = linear_to_srgb(read_image(noisy_path))
+    print(f"reading current: {current_path}")
+    current = linear_to_srgb(read_image(current_path))
+    if noisy.shape != current.shape:
+        raise ValueError(f"shape mismatch: noisy={noisy.shape} current={current.shape}")
+
+    h, w = current.shape[:2]
+    out_acc = np.zeros((h, w, 3), dtype=np.float32)
+    weight_acc = np.zeros((h, w, 1), dtype=np.float32)
+    ys = tile_starts(h, args.tile_size, args.tile_overlap)
+    xs = tile_starts(w, args.tile_size, args.tile_overlap)
+    total = len(ys) * len(xs)
+    start = time.monotonic()
+    tile_index = 0
+    for y0 in ys:
+        for x0 in xs:
+            tile_index += 1
+            n = noisy[y0 : y0 + args.tile_size, x0 : x0 + args.tile_size]
+            c = current[y0 : y0 + args.tile_size, x0 : x0 + args.tile_size]
+            inp_noisy = torch.from_numpy(np.transpose(np.ascontiguousarray(n), (2, 0, 1))[None]).to(device)
+            inp_current = torch.from_numpy(np.transpose(np.ascontiguousarray(c), (2, 0, 1))[None]).to(device)
+            pred = model(make_features(inp_noisy, inp_current), inp_current)
+            refined = np.transpose(pred.squeeze(0).cpu().numpy(), (1, 2, 0))
+            if args.strength != 1.0:
+                refined = np.clip(c + (refined - c) * float(args.strength), 0.0, 1.0)
+            ww = tile_weight(refined.shape[0], refined.shape[1], y0, x0, h, w, args.tile_overlap)
+            out_acc[y0 : y0 + refined.shape[0], x0 : x0 + refined.shape[1]] += refined * ww
+            weight_acc[y0 : y0 + refined.shape[0], x0 : x0 + refined.shape[1]] += ww
+            if tile_index == 1 or tile_index % args.log_every == 0 or tile_index == total:
+                elapsed = time.monotonic() - start
+                print(f"tile {tile_index:04d}/{total} {elapsed / tile_index:.3f}s/tile")
+
+    refined_srgb = np.clip(out_acc / np.maximum(weight_acc, 1.0e-6), 0.0, 1.0)
+    refined_linear = srgb_to_linear(refined_srgb)
+    exr_path = out_dir / f"{name}_refined.exr"
+    tiff_path = out_dir / f"{name}_refined.tiff"
+    preview_path = out_dir / f"{name}_refined_preview.png"
+    meta_path = out_dir / f"{name}_refined_meta.json"
+    write_exr(exr_path, refined_linear)
+    write_tiff(tiff_path, refined_linear)
+    Image.fromarray(to_u8(refined_srgb)).save(preview_path)
+
+    elapsed = time.monotonic() - start
+    meta = {
+        "scene": args.scene,
+        "checkpoint": str(args.checkpoint),
+        "noisy": str(noisy_path),
+        "current": str(current_path),
+        "shape": [h, w, 3],
+        "tile_size": args.tile_size,
+        "tile_overlap": args.tile_overlap,
+        "tile_count": total,
+        "device": str(device),
+        "strength": args.strength,
+        "elapsed_sec": elapsed,
+        "sec_per_tile": elapsed / max(total, 1),
+        "mean_abs_change_srgb": float(np.mean(np.abs(refined_srgb - current))),
+        "current_chroma_hf_p99": chroma_hf_p99(current),
+        "refined_chroma_hf_p99": chroma_hf_p99(refined_srgb),
+        "current_luma_hf_p99": luma_hf_p99(current),
+        "refined_luma_hf_p99": luma_hf_p99(refined_srgb),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(meta, indent=2))
+    print(f"wrote {exr_path}")
+    print(f"wrote {tiff_path}")
+    print(f"wrote {preview_path}")
 
 
 def to_u8(x: np.ndarray) -> np.ndarray:
@@ -446,6 +591,7 @@ def main() -> None:
     p.add_argument("--crop-size", type=int, default=384)
     p.add_argument("--random-per-scene", type=int, default=8)
     p.add_argument("--teacher-match-sigma", type=float, default=28.0)
+    p.add_argument("--clean", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=7)
     p.set_defaults(func=build_crops)
 
@@ -462,6 +608,7 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=2.0e-4)
     p.add_argument("--weak-weight", type=float, default=1.0)
     p.add_argument("--teacher-rgb-weight", type=float, default=1.0)
+    p.add_argument("--noise-gate-weight", type=float, default=0.0)
     p.add_argument("--protect-weight", type=float, default=4.0)
     p.add_argument("--identity-weight", type=float, default=0.18)
     p.add_argument("--chroma-weight", type=float, default=1.2)
@@ -479,6 +626,20 @@ def main() -> None:
     p.add_argument("--device", default="auto")
     p.add_argument("--max-rows", type=int, default=5)
     p.set_defaults(func=apply_crops)
+
+    p = sub.add_parser("apply-full")
+    p.add_argument("--scene", choices=sorted(SCENE_BY_NAME), default=None)
+    p.add_argument("--noisy", default=None)
+    p.add_argument("--current", default=None)
+    p.add_argument("--checkpoint", default="runs/refiner_pilot/train_chroma_luma_guard/refiner_pilot_final.pt")
+    p.add_argument("--output-dir", default="runs/refiner_pilot/full_apply")
+    p.add_argument("--name", default=None)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--tile-size", type=int, default=512)
+    p.add_argument("--tile-overlap", type=int, default=96)
+    p.add_argument("--strength", type=float, default=1.0)
+    p.add_argument("--log-every", type=int, default=10)
+    p.set_defaults(func=apply_full)
 
     args = parser.parse_args()
     args.func(args)
