@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "nagi_
 from nagi_nr.nagiperfect import NagiPerfect, build_nagiperfect_preset
 from apply_chroma_speckle_filter import PRESETS as CHROMA_SPECKLE_PRESETS
 from apply_chroma_speckle_filter import apply_chroma_speckle_filter
+from apply_flat_luma_chroma_smoother import smooth_flat_luma_chroma
 from apply_luma_hf_shrink_filter import PRESETS as LUMA_HF_PRESETS
 from apply_luma_hf_shrink_filter import apply_luma_hf_shrink
 from perfect_nr_probe import image_stats, make_preview, read_image
@@ -43,6 +44,42 @@ POST_CHROMA_SPECKLE_PRESETS = {
     "xstrong": "xstrong",
     "axismax": "axismax",
     "axisplus": "axisplus",
+}
+
+POST_CHROMA_SURFACE_PRESETS = {
+    "off": None,
+    "safe": {
+        "luma_strength": 0.0,
+        "chroma_strength": 0.28,
+        "luma_sigma": 1.0,
+        "chroma_sigma": 2.6,
+        "structure_sigma": 1.2,
+        "edge_sigma": 1.0,
+        "flat_threshold": 0.020,
+        "flat_transition": 0.012,
+        "edge_threshold": 0.030,
+        "edge_transition": 0.015,
+        "highlight_threshold": 0.65,
+        "highlight_transition": 0.25,
+        "hdr_restore_threshold": 0.60,
+        "hdr_restore_transition": 0.18,
+    },
+    "medium": {
+        "luma_strength": 0.0,
+        "chroma_strength": 0.42,
+        "luma_sigma": 1.0,
+        "chroma_sigma": 3.2,
+        "structure_sigma": 1.2,
+        "edge_sigma": 1.0,
+        "flat_threshold": 0.022,
+        "flat_transition": 0.014,
+        "edge_threshold": 0.030,
+        "edge_transition": 0.015,
+        "highlight_threshold": 0.65,
+        "highlight_transition": 0.25,
+        "hdr_restore_threshold": 0.60,
+        "hdr_restore_transition": 0.18,
+    },
 }
 
 
@@ -83,6 +120,16 @@ def apply_chroma_speckle_preset(
         hdr_restore_threshold=float(params["hdr_restore_threshold"]),
         hdr_restore_transition=float(params["hdr_restore_transition"]),
     )
+
+
+def apply_chroma_surface_preset(
+    output: np.ndarray,
+    preset_name: str | None,
+) -> tuple[np.ndarray, dict | None, np.ndarray | None]:
+    if preset_name is None:
+        return output, None, None
+    params = dict(POST_CHROMA_SURFACE_PRESETS[preset_name])
+    return smooth_flat_luma_chroma(output, **params)
 
 
 def apply_luma_hf_preset(
@@ -468,6 +515,12 @@ def main() -> None:
         default="off",
         help="Optional final chroma guard after extra luma cleanup.",
     )
+    parser.add_argument(
+        "--post-chroma-surface-preset",
+        choices=sorted(POST_CHROMA_SURFACE_PRESETS),
+        default="off",
+        help="Optional final flat-region chroma surface cleanup. It does not change luma.",
+    )
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
@@ -581,6 +634,13 @@ def main() -> None:
         output, post_extra_final_chroma_speckle_stats, post_extra_final_chroma_speckle_blend = (
             apply_chroma_speckle_preset(output, image, post_extra_final_chroma_speckle_source)
         )
+    post_chroma_surface_stats = None
+    post_chroma_surface_gate = None
+    post_chroma_surface_source = POST_CHROMA_SURFACE_PRESETS[args.post_chroma_surface_preset]
+    if post_chroma_surface_source is not None:
+        output, post_chroma_surface_stats, post_chroma_surface_gate = apply_chroma_surface_preset(
+            output, args.post_chroma_surface_preset
+        )
 
     exr_path = out_dir / f"{name}_nagiperfect.exr"
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
@@ -597,6 +657,7 @@ def main() -> None:
     extra_chroma_speckle_blend_path = out_dir / f"{name}_post_extra_chroma_speckle_blend.png"
     extra_luma_hf_gate_path = out_dir / f"{name}_post_extra_luma_hf_gate.png"
     extra_final_chroma_speckle_blend_path = out_dir / f"{name}_post_extra_final_chroma_speckle_blend.png"
+    chroma_surface_gate_path = out_dir / f"{name}_post_chroma_surface_gate.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
 
     write_exr(exr_path, output)
@@ -650,6 +711,10 @@ def main() -> None:
         Image.fromarray(
             (np.clip(post_extra_final_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
         ).save(extra_final_chroma_speckle_blend_path)
+    if post_chroma_surface_gate is not None:
+        Image.fromarray((np.clip(post_chroma_surface_gate, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            chroma_surface_gate_path
+        )
 
     meta = {
         "input": str(input_path),
@@ -680,6 +745,7 @@ def main() -> None:
             "post_extra_final_chroma_speckle_blend": str(extra_final_chroma_speckle_blend_path)
             if post_extra_final_chroma_speckle_blend is not None
             else None,
+            "post_chroma_surface_gate": str(chroma_surface_gate_path) if post_chroma_surface_gate is not None else None,
         },
         "input_stats": image_stats(image),
         "output_stats": image_stats(output),
@@ -753,6 +819,11 @@ def main() -> None:
             "preset": args.post_extra_final_chroma_speckle_preset,
             "source_preset": post_extra_final_chroma_speckle_source,
             "stats": post_extra_final_chroma_speckle_stats,
+        },
+        "post_chroma_surface": {
+            "preset": args.post_chroma_surface_preset,
+            "source_preset": args.post_chroma_surface_preset if post_chroma_surface_source is not None else None,
+            "stats": post_chroma_surface_stats,
         },
         "tiling": {
             "tile_size": int(args.tile_size),
