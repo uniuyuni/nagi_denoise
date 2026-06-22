@@ -192,6 +192,45 @@ def crop_with_offset(img: np.ndarray, x: int, y: int, size: int) -> np.ndarray:
     return img[y : y + size, x : x + size]
 
 
+def window_sum(integral: np.ndarray, x: int, y: int, size: int) -> float:
+    x0 = int(x)
+    y0 = int(y)
+    x1 = x0 + int(size)
+    y1 = y0 + int(size)
+    return float(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
+
+
+def select_hard_rois(current: np.ndarray, noisy: np.ndarray, crop_size: int, count: int) -> list[tuple[str, int, int]]:
+    if count <= 0:
+        return []
+    h, w = current.shape[:2]
+    if h < crop_size or w < crop_size:
+        return []
+    dark_dot = dark_chroma_dot_gate(current, noisy)
+    magenta_dot = dark_chroma_axis_dot_gate(current, noisy, np.array([0.5, -1.0, 0.5], dtype=np.float32))
+    blue_dot = dark_chroma_axis_dot_gate(current, noisy, np.array([-0.5, -0.5, 1.0], dtype=np.float32))
+    luma_dot = dark_luma_dot_gate(current, noisy)
+    score = dark_dot + 0.85 * magenta_dot + 0.85 * blue_dot + 0.30 * luma_dot
+    integral = np.pad(score.astype(np.float64), ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    stride = max(64, crop_size // 3)
+    candidates: list[tuple[float, int, int]] = []
+    for y in range(0, h - crop_size + 1, stride):
+        for x in range(0, w - crop_size + 1, stride):
+            candidates.append((window_sum(integral, x, y, crop_size), x, y))
+    candidates.sort(reverse=True)
+    selected: list[tuple[str, int, int]] = []
+    min_dist = crop_size * 0.65
+    for _, x, y in candidates:
+        cx = x + crop_size * 0.5
+        cy = y + crop_size * 0.5
+        if any(abs(cx - (sx + crop_size * 0.5)) < min_dist and abs(cy - (sy + crop_size * 0.5)) < min_dist for _, sx, sy in selected):
+            continue
+        selected.append((f"hard_{len(selected):02d}", x, y))
+        if len(selected) >= count:
+            break
+    return selected
+
+
 def read_scene_arrays(spec: SceneSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     noisy = linear_to_srgb(read_image(spec.noisy))
     current = linear_to_srgb(read_image(spec.current))
@@ -219,6 +258,7 @@ def build_crops(args: argparse.Namespace) -> None:
             x = rng.randint(0, max(0, w - args.crop_size))
             y = rng.randint(0, max(0, h - args.crop_size))
             rois.append((f"random_{i:02d}", x, y))
+        rois.extend(select_hard_rois(current, noisy, args.crop_size, args.hard_per_scene))
 
         for label, x, y in rois:
             n = crop_with_offset(noisy, x, y, args.crop_size)
@@ -937,6 +977,7 @@ def main() -> None:
     p.add_argument("--output-dir", default="runs/refiner_pilot")
     p.add_argument("--crop-size", type=int, default=384)
     p.add_argument("--random-per-scene", type=int, default=8)
+    p.add_argument("--hard-per-scene", type=int, default=0)
     p.add_argument("--teacher-match-sigma", type=float, default=28.0)
     p.add_argument("--clean", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=7)
