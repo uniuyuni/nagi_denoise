@@ -136,6 +136,18 @@ def dark_chroma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
     return (dark * dot).astype(np.float32)
 
 
+def dark_luma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
+    cur = _safe_rgb(current)
+    noi = _safe_rgb(noisy)
+    y = luma(cur)
+    dark = np.clip((0.62 - y) / 0.46, 0.0, 1.0)
+    dark = (dark * dark * (3.0 - 2.0 * dark)).astype(np.float32)
+    cur_hf = detail_map(cur, sigma=1.2)
+    noi_hf = detail_map(noi, sigma=1.2)
+    dot = np.clip((np.maximum(cur_hf, noi_hf) - 0.014) / 0.034, 0.0, 1.0).astype(np.float32)
+    return (dark * dot).astype(np.float32)
+
+
 def match_teacher_low_frequency(current: np.ndarray, teacher: np.ndarray, sigma: float = 28.0) -> np.ndarray:
     """Keep Nagi's local tone/color and borrow only PL's local residual texture.
 
@@ -203,6 +215,7 @@ def build_crops(args: argparse.Namespace) -> None:
             chroma_noise = np.maximum(chroma_hf_map(c), chroma_hf_map(n))
             noise_gate = np.clip((chroma_noise - 0.010) / 0.035, 0.0, 1.0).astype(np.float32)
             dark_dot_gate = dark_chroma_dot_gate(c, n)
+            dark_luma_gate = dark_luma_dot_gate(c, n)
             weak = np.clip(flat * useful, 0.0, 1.0).astype(np.float32)
 
             stem = f"{spec.name}_{label}_x{x}_y{y}"
@@ -217,6 +230,7 @@ def build_crops(args: argparse.Namespace) -> None:
                 protect=edge.astype(np.float16),
                 noise_gate=noise_gate.astype(np.float16),
                 dark_dot_gate=dark_dot_gate.astype(np.float16),
+                dark_luma_dot_gate=dark_luma_gate.astype(np.float16),
                 scene=spec.name,
                 label=label,
                 x=np.int32(x),
@@ -233,6 +247,7 @@ def build_crops(args: argparse.Namespace) -> None:
                     "protect_mean": float(np.mean(edge)),
                     "noise_gate_mean": float(np.mean(noise_gate)),
                     "dark_dot_gate_mean": float(np.mean(dark_dot_gate)),
+                    "dark_luma_dot_gate_mean": float(np.mean(dark_luma_gate)),
                     "teacher_delta_mean": float(np.mean(delta)),
                     "teacher_raw_delta_mean": float(np.mean(np.linalg.norm(t_raw - c, axis=2))),
                 }
@@ -314,6 +329,44 @@ class ChromaPilotRefiner(nn.Module):
         return out
 
 
+class ChromaLumaDotRefiner(nn.Module):
+    def __init__(
+        self,
+        width: int = 32,
+        blocks: int = 5,
+        max_delta: float = 0.100,
+        max_luma_delta: float = 0.012,
+        in_channels: int = 15,
+    ) -> None:
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.max_luma_delta = float(max_luma_delta)
+        self.head = nn.Conv2d(in_channels, width, 3, padding=1)
+        self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+        self.chroma_tail = nn.Conv2d(width, 3, 3, padding=1)
+        self.luma_tail = nn.Conv2d(width, 1, 3, padding=1)
+
+    def forward_with_aux(self, features: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        wp = torch.tensor([0.299, 0.587, 0.114], device=current.device, dtype=current.dtype).view(1, 3, 1, 1)
+        current_y = (current * wp).sum(1, keepdim=True)
+        z = self.body(F.gelu(self.head(features)))
+        raw_chroma_delta = torch.tanh(self.chroma_tail(z)) * self.max_delta
+        delta_y = (raw_chroma_delta * wp).sum(1, keepdim=True)
+        chroma_delta = raw_chroma_delta - delta_y
+        raw_luma_delta = torch.tanh(self.luma_tail(z)) * self.max_luma_delta
+        luma_delta = raw_luma_delta - F.avg_pool2d(raw_luma_delta, kernel_size=9, stride=1, padding=4)
+        out = torch.clamp(current + chroma_delta + luma_delta, 0.0, 1.0)
+        out_y = (out * wp).sum(1, keepdim=True)
+        # Preserve the requested tiny luma impulse correction, while removing
+        # luma drift caused by RGB clamping or chroma-channel imbalance.
+        out = torch.clamp(out + (current_y + luma_delta - out_y), 0.0, 1.0)
+        return out, {"delta": chroma_delta, "luma_delta": luma_delta}
+
+    def forward(self, features: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+        out, _ = self.forward_with_aux(features, current)
+        return out
+
+
 def refine_with_aux(model: nn.Module, noisy: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     features = make_features(noisy, current, getattr(model, "feature_set", "basic"))
     if hasattr(model, "forward_with_aux"):
@@ -379,6 +432,7 @@ class CropDataset(torch.utils.data.Dataset):
             "protect": take("protect", False),
             "noise_gate": take("noise_gate", False) if "noise_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
             "dark_dot_gate": take("dark_dot_gate", False) if "dark_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
+            "dark_luma_dot_gate": take("dark_luma_dot_gate", False) if "dark_luma_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
         }
 
 
@@ -400,7 +454,14 @@ def feature_channels(feature_set: str) -> int:
     raise ValueError(f"unknown feature set: {feature_set}")
 
 
-def create_model(kind: str, width: int, blocks: int, max_delta: float, feature_set: str = "basic") -> nn.Module:
+def create_model(
+    kind: str,
+    width: int,
+    blocks: int,
+    max_delta: float,
+    feature_set: str = "basic",
+    max_luma_delta: float = 0.012,
+) -> nn.Module:
     if kind == "residual":
         model: nn.Module = PilotRefiner(width=width, blocks=blocks, max_delta=max_delta, in_channels=feature_channels(feature_set))
         model.feature_set = feature_set  # type: ignore[attr-defined]
@@ -411,6 +472,16 @@ def create_model(kind: str, width: int, blocks: int, max_delta: float, feature_s
         return model
     if kind == "chroma":
         model = ChromaPilotRefiner(width=width, blocks=blocks, max_delta=max_delta, in_channels=feature_channels(feature_set))
+        model.feature_set = feature_set  # type: ignore[attr-defined]
+        return model
+    if kind == "chroma_luma_dot":
+        model = ChromaLumaDotRefiner(
+            width=width,
+            blocks=blocks,
+            max_delta=max_delta,
+            max_luma_delta=max_luma_delta,
+            in_channels=feature_channels(feature_set),
+        )
         model.feature_set = feature_set  # type: ignore[attr-defined]
         return model
     raise ValueError(f"unknown model kind: {kind}")
@@ -429,6 +500,7 @@ def load_model(checkpoint: str | Path, device: torch.device) -> nn.Module:
         blocks=int(ckpt["blocks"]),
         max_delta=float(ckpt["max_delta"]),
         feature_set=str(ckpt.get("feature_set", "basic")),
+        max_luma_delta=float(ckpt.get("max_luma_delta", 0.012)),
     )
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval()
@@ -442,7 +514,14 @@ def train(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     ds = CropDataset(Path(args.crop_dir), args.patch_size, args.iters * args.batch_size, args.seed)
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, drop_last=True)
-    model = create_model(args.model_kind, width=args.width, blocks=args.blocks, max_delta=args.max_delta, feature_set=args.feature_set).to(device)
+    model = create_model(
+        args.model_kind,
+        width=args.width,
+        blocks=args.blocks,
+        max_delta=args.max_delta,
+        feature_set=args.feature_set,
+        max_luma_delta=args.max_luma_delta,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
 
     log_path = out_dir / "stdout.log"
@@ -459,6 +538,7 @@ def train(args: argparse.Namespace) -> None:
             protect = batch["protect"].to(device)
             noise_gate = batch["noise_gate"].to(device)
             dark_dot_gate = batch["dark_dot_gate"].to(device)
+            dark_luma_dot_gate = batch["dark_luma_dot_gate"].to(device)
             pred, aux = refine_with_aux(model, noisy, current)
 
             weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight + dark_dot_gate * args.dark_dot_weight)
@@ -472,9 +552,20 @@ def train(args: argparse.Namespace) -> None:
             loss_identity = (torch.abs(pred - current) * (protect_w + args.identity_weight)).mean()
             loss_chroma = chroma_loss(pred, teacher, chroma_w) * args.chroma_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
+            loss_luma_dot = luma_teacher_loss(pred, teacher, dark_luma_dot_gate) * args.luma_dot_weight
+            loss_luma_delta_sparse = luma_delta_loss(aux.get("luma_delta"), dark_luma_dot_gate, protect) * args.luma_dot_sparsity_weight
             loss_gate = gate_loss(aux.get("gate"), weak, protect, noise_gate, args.gate_weight, args.gate_sparsity_weight)
             loss_tv = total_variation(pred - current) * args.tv_weight
-            loss = args.teacher_rgb_weight * loss_teacher + loss_identity + loss_chroma + loss_luma_identity + loss_gate + loss_tv
+            loss = (
+                args.teacher_rgb_weight * loss_teacher
+                + loss_identity
+                + loss_chroma
+                + loss_luma_identity
+                + loss_luma_dot
+                + loss_luma_delta_sparse
+                + loss_gate
+                + loss_tv
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -485,6 +576,7 @@ def train(args: argparse.Namespace) -> None:
                     f"step {step:05d}/{args.iters} loss={float(loss.detach()):.6f} "
                     f"teacher={float(loss_teacher.detach()):.6f} identity={float(loss_identity.detach()):.6f} "
                     f"chroma={float(loss_chroma.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
+                    f"luma_dot={float(loss_luma_dot.detach()):.6f} luma_sparse={float(loss_luma_delta_sparse.detach()):.6f} "
                     f"gate={float(loss_gate.detach()):.6f} "
                     f"tv={float(loss_tv.detach()):.6f} "
                     f"{elapsed / step:.3f}s/it"
@@ -500,6 +592,7 @@ def train(args: argparse.Namespace) -> None:
             "width": args.width,
             "blocks": args.blocks,
             "max_delta": args.max_delta,
+            "max_luma_delta": args.max_luma_delta,
         }
         ckpt_path = out_dir / "refiner_pilot_final.pt"
         torch.save(ckpt, ckpt_path)
@@ -520,6 +613,20 @@ def luma_identity_loss(pred: torch.Tensor, current: torch.Tensor, protect: torch
     yc = (current * wp).sum(1, keepdim=True)
     weight = 1.0 + protect * float(protect_weight)
     return (torch.abs(yp - yc) * weight).mean()
+
+
+def luma_teacher_loss(pred: torch.Tensor, teacher: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    wp = torch.tensor([0.299, 0.587, 0.114], device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    yp = (pred * wp).sum(1, keepdim=True)
+    yt = (teacher * wp).sum(1, keepdim=True)
+    return (torch.abs(yp - yt) * weight).mean()
+
+
+def luma_delta_loss(luma_delta: torch.Tensor | None, dot_gate: torch.Tensor, protect: torch.Tensor) -> torch.Tensor:
+    if luma_delta is None:
+        return torch.zeros((), device=dot_gate.device, dtype=dot_gate.dtype)
+    outside_dot = 1.0 - torch.clamp(dot_gate, 0.0, 1.0)
+    return (torch.abs(luma_delta) * (outside_dot + protect * 2.0)).mean()
 
 
 def gate_loss(
@@ -689,6 +796,8 @@ def apply_full(args: argparse.Namespace) -> None:
     }
     if isinstance(model, GatedPilotRefiner):
         meta["model_kind"] = "gated"
+    elif isinstance(model, ChromaLumaDotRefiner):
+        meta["model_kind"] = "chroma_luma_dot"
     elif isinstance(model, ChromaPilotRefiner):
         meta["model_kind"] = "chroma"
     else:
@@ -748,11 +857,12 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=600)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=160)
-    p.add_argument("--model-kind", choices=["residual", "gated", "chroma"], default="residual")
+    p.add_argument("--model-kind", choices=["residual", "gated", "chroma", "chroma_luma_dot"], default="residual")
     p.add_argument("--feature-set", choices=["basic", "texture"], default="basic")
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--max-delta", type=float, default=0.050)
+    p.add_argument("--max-luma-delta", type=float, default=0.012)
     p.add_argument("--lr", type=float, default=2.0e-4)
     p.add_argument("--weak-weight", type=float, default=1.0)
     p.add_argument("--teacher-rgb-weight", type=float, default=1.0)
@@ -766,6 +876,8 @@ def main() -> None:
     p.add_argument("--chroma-weight", type=float, default=1.2)
     p.add_argument("--luma-change-weight", type=float, default=0.0)
     p.add_argument("--luma-protect-weight", type=float, default=3.0)
+    p.add_argument("--luma-dot-weight", type=float, default=0.0)
+    p.add_argument("--luma-dot-sparsity-weight", type=float, default=0.0)
     p.add_argument("--gate-weight", type=float, default=0.0)
     p.add_argument("--gate-sparsity-weight", type=float, default=0.0)
     p.add_argument("--tv-weight", type=float, default=0.035)
