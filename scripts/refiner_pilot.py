@@ -125,6 +125,17 @@ def chroma_hf_map(img: np.ndarray, sigma: float = 1.2) -> np.ndarray:
     return np.sqrt(np.sum(hf * hf, axis=2)).astype(np.float32)
 
 
+def dark_chroma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
+    cur = _safe_rgb(current)
+    noi = _safe_rgb(noisy)
+    y = luma(cur)
+    dark = np.clip((0.58 - y) / 0.42, 0.0, 1.0)
+    dark = (dark * dark * (3.0 - 2.0 * dark)).astype(np.float32)
+    chroma_noise = np.maximum(chroma_hf_map(cur), chroma_hf_map(noi))
+    dot = np.clip((chroma_noise - 0.016) / 0.032, 0.0, 1.0).astype(np.float32)
+    return (dark * dot).astype(np.float32)
+
+
 def match_teacher_low_frequency(current: np.ndarray, teacher: np.ndarray, sigma: float = 28.0) -> np.ndarray:
     """Keep Nagi's local tone/color and borrow only PL's local residual texture.
 
@@ -191,6 +202,7 @@ def build_crops(args: argparse.Namespace) -> None:
             useful = np.clip(delta / 0.060, 0.0, 1.0)
             chroma_noise = np.maximum(chroma_hf_map(c), chroma_hf_map(n))
             noise_gate = np.clip((chroma_noise - 0.010) / 0.035, 0.0, 1.0).astype(np.float32)
+            dark_dot_gate = dark_chroma_dot_gate(c, n)
             weak = np.clip(flat * useful, 0.0, 1.0).astype(np.float32)
 
             stem = f"{spec.name}_{label}_x{x}_y{y}"
@@ -204,6 +216,7 @@ def build_crops(args: argparse.Namespace) -> None:
                 weak=weak.astype(np.float16),
                 protect=edge.astype(np.float16),
                 noise_gate=noise_gate.astype(np.float16),
+                dark_dot_gate=dark_dot_gate.astype(np.float16),
                 scene=spec.name,
                 label=label,
                 x=np.int32(x),
@@ -219,6 +232,7 @@ def build_crops(args: argparse.Namespace) -> None:
                     "weak_mean": float(np.mean(weak)),
                     "protect_mean": float(np.mean(edge)),
                     "noise_gate_mean": float(np.mean(noise_gate)),
+                    "dark_dot_gate_mean": float(np.mean(dark_dot_gate)),
                     "teacher_delta_mean": float(np.mean(delta)),
                     "teacher_raw_delta_mean": float(np.mean(np.linalg.norm(t_raw - c, axis=2))),
                 }
@@ -364,6 +378,7 @@ class CropDataset(torch.utils.data.Dataset):
             "weak": take("weak", False),
             "protect": take("protect", False),
             "noise_gate": take("noise_gate", False) if "noise_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
+            "dark_dot_gate": take("dark_dot_gate", False) if "dark_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
         }
 
 
@@ -443,13 +458,19 @@ def train(args: argparse.Namespace) -> None:
             weak = batch["weak"].to(device)
             protect = batch["protect"].to(device)
             noise_gate = batch["noise_gate"].to(device)
+            dark_dot_gate = batch["dark_dot_gate"].to(device)
             pred, aux = refine_with_aux(model, noisy, current)
 
-            weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight)
+            weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight + dark_dot_gate * args.dark_dot_weight)
+            chroma_w = torch.clamp(
+                weak + noise_gate * args.chroma_noise_weight + dark_dot_gate * args.dark_dot_chroma_weight,
+                0.0,
+                args.chroma_weight_clip,
+            )
             protect_w = protect * args.protect_weight
             loss_teacher = (torch.abs(pred - teacher) * weak_w).mean()
             loss_identity = (torch.abs(pred - current) * (protect_w + args.identity_weight)).mean()
-            loss_chroma = chroma_loss(pred, teacher, weak) * args.chroma_weight
+            loss_chroma = chroma_loss(pred, teacher, chroma_w) * args.chroma_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
             loss_gate = gate_loss(aux.get("gate"), weak, protect, noise_gate, args.gate_weight, args.gate_sparsity_weight)
             loss_tv = total_variation(pred - current) * args.tv_weight
@@ -736,6 +757,10 @@ def main() -> None:
     p.add_argument("--weak-weight", type=float, default=1.0)
     p.add_argument("--teacher-rgb-weight", type=float, default=1.0)
     p.add_argument("--noise-gate-weight", type=float, default=0.0)
+    p.add_argument("--dark-dot-weight", type=float, default=0.0)
+    p.add_argument("--chroma-noise-weight", type=float, default=0.0)
+    p.add_argument("--dark-dot-chroma-weight", type=float, default=0.0)
+    p.add_argument("--chroma-weight-clip", type=float, default=1.0)
     p.add_argument("--protect-weight", type=float, default=4.0)
     p.add_argument("--identity-weight", type=float, default=0.18)
     p.add_argument("--chroma-weight", type=float, default=1.2)
