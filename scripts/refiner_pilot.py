@@ -125,6 +125,15 @@ def chroma_hf_map(img: np.ndarray, sigma: float = 1.2) -> np.ndarray:
     return np.sqrt(np.sum(hf * hf, axis=2)).astype(np.float32)
 
 
+def chroma_axis_hf_map(img: np.ndarray, axis: np.ndarray, sigma: float = 1.2) -> np.ndarray:
+    y = luma(img)[..., None]
+    chroma = _safe_rgb(img) - y
+    hf = chroma - gaussian_filter(chroma, sigma=(float(sigma), float(sigma), 0.0), mode="reflect")
+    axis = np.asarray(axis, dtype=np.float32)
+    axis = axis / max(float(np.sqrt(np.sum(axis * axis))), 1.0e-6)
+    return np.abs(np.sum(hf * axis.reshape(1, 1, 3), axis=2)).astype(np.float32)
+
+
 def dark_chroma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
     cur = _safe_rgb(current)
     noi = _safe_rgb(noisy)
@@ -134,6 +143,19 @@ def dark_chroma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
     chroma_noise = np.maximum(chroma_hf_map(cur), chroma_hf_map(noi))
     dot = np.clip((chroma_noise - 0.016) / 0.032, 0.0, 1.0).astype(np.float32)
     return (dark * dot).astype(np.float32)
+
+
+def dark_chroma_axis_dot_gate(current: np.ndarray, noisy: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    cur = _safe_rgb(current)
+    noi = _safe_rgb(noisy)
+    y = luma(cur)
+    dark = np.clip((0.62 - y) / 0.46, 0.0, 1.0)
+    dark = (dark * dark * (3.0 - 2.0 * dark)).astype(np.float32)
+    chroma_noise = np.maximum(chroma_hf_map(cur), chroma_hf_map(noi))
+    chroma_dot = np.clip((chroma_noise - 0.016) / 0.032, 0.0, 1.0).astype(np.float32)
+    axis_noise = np.maximum(chroma_axis_hf_map(cur, axis), chroma_axis_hf_map(noi, axis))
+    axis_dot = np.clip((axis_noise - 0.007) / 0.022, 0.0, 1.0).astype(np.float32)
+    return (dark * chroma_dot * axis_dot).astype(np.float32)
 
 
 def dark_luma_dot_gate(current: np.ndarray, noisy: np.ndarray) -> np.ndarray:
@@ -215,6 +237,8 @@ def build_crops(args: argparse.Namespace) -> None:
             chroma_noise = np.maximum(chroma_hf_map(c), chroma_hf_map(n))
             noise_gate = np.clip((chroma_noise - 0.010) / 0.035, 0.0, 1.0).astype(np.float32)
             dark_dot_gate = dark_chroma_dot_gate(c, n)
+            magenta_dot_gate = dark_chroma_axis_dot_gate(c, n, np.array([0.5, -1.0, 0.5], dtype=np.float32))
+            blue_dot_gate = dark_chroma_axis_dot_gate(c, n, np.array([-0.5, -0.5, 1.0], dtype=np.float32))
             dark_luma_gate = dark_luma_dot_gate(c, n)
             weak = np.clip(flat * useful, 0.0, 1.0).astype(np.float32)
 
@@ -230,6 +254,8 @@ def build_crops(args: argparse.Namespace) -> None:
                 protect=edge.astype(np.float16),
                 noise_gate=noise_gate.astype(np.float16),
                 dark_dot_gate=dark_dot_gate.astype(np.float16),
+                magenta_dot_gate=magenta_dot_gate.astype(np.float16),
+                blue_dot_gate=blue_dot_gate.astype(np.float16),
                 dark_luma_dot_gate=dark_luma_gate.astype(np.float16),
                 scene=spec.name,
                 label=label,
@@ -247,6 +273,8 @@ def build_crops(args: argparse.Namespace) -> None:
                     "protect_mean": float(np.mean(edge)),
                     "noise_gate_mean": float(np.mean(noise_gate)),
                     "dark_dot_gate_mean": float(np.mean(dark_dot_gate)),
+                    "magenta_dot_gate_mean": float(np.mean(magenta_dot_gate)),
+                    "blue_dot_gate_mean": float(np.mean(blue_dot_gate)),
                     "dark_luma_dot_gate_mean": float(np.mean(dark_luma_gate)),
                     "teacher_delta_mean": float(np.mean(delta)),
                     "teacher_raw_delta_mean": float(np.mean(np.linalg.norm(t_raw - c, axis=2))),
@@ -432,6 +460,8 @@ class CropDataset(torch.utils.data.Dataset):
             "protect": take("protect", False),
             "noise_gate": take("noise_gate", False) if "noise_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
             "dark_dot_gate": take("dark_dot_gate", False) if "dark_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
+            "magenta_dot_gate": take("magenta_dot_gate", False) if "magenta_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
+            "blue_dot_gate": take("blue_dot_gate", False) if "blue_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
             "dark_luma_dot_gate": take("dark_luma_dot_gate", False) if "dark_luma_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
         }
 
@@ -538,12 +568,21 @@ def train(args: argparse.Namespace) -> None:
             protect = batch["protect"].to(device)
             noise_gate = batch["noise_gate"].to(device)
             dark_dot_gate = batch["dark_dot_gate"].to(device)
+            magenta_dot_gate = batch["magenta_dot_gate"].to(device)
+            blue_dot_gate = batch["blue_dot_gate"].to(device)
             dark_luma_dot_gate = batch["dark_luma_dot_gate"].to(device)
             pred, aux = refine_with_aux(model, noisy, current)
 
-            weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight + dark_dot_gate * args.dark_dot_weight)
+            color_axis_gate = magenta_dot_gate * args.magenta_dot_weight + blue_dot_gate * args.blue_dot_weight
+            weak_w = 0.08 + weak * args.weak_weight * (
+                1.0 + noise_gate * args.noise_gate_weight + dark_dot_gate * args.dark_dot_weight + color_axis_gate
+            )
             chroma_w = torch.clamp(
-                weak + noise_gate * args.chroma_noise_weight + dark_dot_gate * args.dark_dot_chroma_weight,
+                weak
+                + noise_gate * args.chroma_noise_weight
+                + dark_dot_gate * args.dark_dot_chroma_weight
+                + magenta_dot_gate * args.magenta_dot_chroma_weight
+                + blue_dot_gate * args.blue_dot_chroma_weight,
                 0.0,
                 args.chroma_weight_clip,
             )
@@ -551,6 +590,8 @@ def train(args: argparse.Namespace) -> None:
             loss_teacher = (torch.abs(pred - teacher) * weak_w).mean()
             loss_identity = (torch.abs(pred - current) * (protect_w + args.identity_weight)).mean()
             loss_chroma = chroma_loss(pred, teacher, chroma_w) * args.chroma_weight
+            loss_magenta_axis = chroma_axis_loss(pred, teacher, magenta_dot_gate, [0.5, -1.0, 0.5]) * args.magenta_axis_weight
+            loss_blue_axis = chroma_axis_loss(pred, teacher, blue_dot_gate, [-0.5, -0.5, 1.0]) * args.blue_axis_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
             loss_luma_dot = luma_teacher_loss(pred, teacher, dark_luma_dot_gate) * args.luma_dot_weight
             loss_luma_delta_sparse = luma_delta_loss(aux.get("luma_delta"), dark_luma_dot_gate, protect) * args.luma_dot_sparsity_weight
@@ -560,6 +601,8 @@ def train(args: argparse.Namespace) -> None:
                 args.teacher_rgb_weight * loss_teacher
                 + loss_identity
                 + loss_chroma
+                + loss_magenta_axis
+                + loss_blue_axis
                 + loss_luma_identity
                 + loss_luma_dot
                 + loss_luma_delta_sparse
@@ -575,7 +618,8 @@ def train(args: argparse.Namespace) -> None:
                 msg = (
                     f"step {step:05d}/{args.iters} loss={float(loss.detach()):.6f} "
                     f"teacher={float(loss_teacher.detach()):.6f} identity={float(loss_identity.detach()):.6f} "
-                    f"chroma={float(loss_chroma.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
+                    f"chroma={float(loss_chroma.detach()):.6f} mag_axis={float(loss_magenta_axis.detach()):.6f} "
+                    f"blue_axis={float(loss_blue_axis.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
                     f"luma_dot={float(loss_luma_dot.detach()):.6f} luma_sparse={float(loss_luma_delta_sparse.detach()):.6f} "
                     f"gate={float(loss_gate.detach()):.6f} "
                     f"tv={float(loss_tv.detach()):.6f} "
@@ -605,6 +649,17 @@ def chroma_loss(pred: torch.Tensor, teacher: torch.Tensor, weight: torch.Tensor)
     yp = (pred * wp).sum(1, keepdim=True)
     yt = (teacher * wp).sum(1, keepdim=True)
     return (torch.abs((pred - yp) - (teacher - yt)) * weight).mean()
+
+
+def chroma_axis_loss(pred: torch.Tensor, teacher: torch.Tensor, weight: torch.Tensor, axis: list[float]) -> torch.Tensor:
+    wp = torch.tensor([0.299, 0.587, 0.114], device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    ax = torch.tensor(axis, device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    ax = ax / torch.clamp(torch.sqrt(torch.sum(ax * ax)), min=1.0e-6)
+    pred_chroma = pred - (pred * wp).sum(1, keepdim=True)
+    teacher_chroma = teacher - (teacher * wp).sum(1, keepdim=True)
+    pred_axis = (pred_chroma * ax).sum(1, keepdim=True)
+    teacher_axis = (teacher_chroma * ax).sum(1, keepdim=True)
+    return (torch.abs(pred_axis - teacher_axis) * weight).mean()
 
 
 def luma_identity_loss(pred: torch.Tensor, current: torch.Tensor, protect: torch.Tensor, protect_weight: float) -> torch.Tensor:
@@ -868,12 +923,18 @@ def main() -> None:
     p.add_argument("--teacher-rgb-weight", type=float, default=1.0)
     p.add_argument("--noise-gate-weight", type=float, default=0.0)
     p.add_argument("--dark-dot-weight", type=float, default=0.0)
+    p.add_argument("--magenta-dot-weight", type=float, default=0.0)
+    p.add_argument("--blue-dot-weight", type=float, default=0.0)
     p.add_argument("--chroma-noise-weight", type=float, default=0.0)
     p.add_argument("--dark-dot-chroma-weight", type=float, default=0.0)
+    p.add_argument("--magenta-dot-chroma-weight", type=float, default=0.0)
+    p.add_argument("--blue-dot-chroma-weight", type=float, default=0.0)
     p.add_argument("--chroma-weight-clip", type=float, default=1.0)
     p.add_argument("--protect-weight", type=float, default=4.0)
     p.add_argument("--identity-weight", type=float, default=0.18)
     p.add_argument("--chroma-weight", type=float, default=1.2)
+    p.add_argument("--magenta-axis-weight", type=float, default=0.0)
+    p.add_argument("--blue-axis-weight", type=float, default=0.0)
     p.add_argument("--luma-change-weight", type=float, default=0.0)
     p.add_argument("--luma-protect-weight", type=float, default=3.0)
     p.add_argument("--luma-dot-weight", type=float, default=0.0)
