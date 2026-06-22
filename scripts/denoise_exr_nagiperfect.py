@@ -42,6 +42,7 @@ POST_CHROMA_SPECKLE_PRESETS = {
     "quality": "quality",
     "xstrong": "xstrong",
     "axismax": "axismax",
+    "axisplus": "axisplus",
 }
 
 
