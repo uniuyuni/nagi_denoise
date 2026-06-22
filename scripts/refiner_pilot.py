@@ -243,10 +243,10 @@ class ResidualBlock(nn.Module):
 
 
 class PilotRefiner(nn.Module):
-    def __init__(self, width: int = 32, blocks: int = 5, max_delta: float = 0.050) -> None:
+    def __init__(self, width: int = 32, blocks: int = 5, max_delta: float = 0.050, in_channels: int = 11) -> None:
         super().__init__()
         self.max_delta = float(max_delta)
-        self.head = nn.Conv2d(11, width, 3, padding=1)
+        self.head = nn.Conv2d(in_channels, width, 3, padding=1)
         self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
         self.tail = nn.Conv2d(width, 3, 3, padding=1)
 
@@ -256,12 +256,78 @@ class PilotRefiner(nn.Module):
         return torch.clamp(current + delta, 0.0, 1.0)
 
 
-def make_features(noisy: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+class GatedPilotRefiner(nn.Module):
+    def __init__(self, width: int = 32, blocks: int = 5, max_delta: float = 0.080, in_channels: int = 11) -> None:
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.head = nn.Conv2d(in_channels, width, 3, padding=1)
+        self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+        self.delta_tail = nn.Conv2d(width, 3, 3, padding=1)
+        self.gate_tail = nn.Conv2d(width, 1, 3, padding=1)
+
+    def forward_with_aux(self, features: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        y = self.body(F.gelu(self.head(features)))
+        delta = torch.tanh(self.delta_tail(y)) * self.max_delta
+        gate = torch.sigmoid(self.gate_tail(y))
+        out = torch.clamp(current + delta * gate, 0.0, 1.0)
+        return out, {"gate": gate, "delta": delta}
+
+    def forward(self, features: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+        out, _ = self.forward_with_aux(features, current)
+        return out
+
+
+class ChromaPilotRefiner(nn.Module):
+    def __init__(self, width: int = 32, blocks: int = 5, max_delta: float = 0.100, in_channels: int = 15) -> None:
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.head = nn.Conv2d(in_channels, width, 3, padding=1)
+        self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+        self.tail = nn.Conv2d(width, 3, 3, padding=1)
+
+    def forward_with_aux(self, features: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        y = (current * torch.tensor([0.299, 0.587, 0.114], device=current.device, dtype=current.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
+        raw_delta = torch.tanh(self.tail(self.body(F.gelu(self.head(features))))) * self.max_delta
+        delta_mean = (raw_delta * torch.tensor([0.299, 0.587, 0.114], device=current.device, dtype=current.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
+        chroma_delta = raw_delta - delta_mean
+        out = torch.clamp(current + chroma_delta, 0.0, 1.0)
+        out_y = (out * torch.tensor([0.299, 0.587, 0.114], device=out.device, dtype=out.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
+        out = torch.clamp(out + (y - out_y), 0.0, 1.0)
+        return out, {"delta": chroma_delta}
+
+    def forward(self, features: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+        out, _ = self.forward_with_aux(features, current)
+        return out
+
+
+def refine_with_aux(model: nn.Module, noisy: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    features = make_features(noisy, current, getattr(model, "feature_set", "basic"))
+    if hasattr(model, "forward_with_aux"):
+        return model.forward_with_aux(features, current)  # type: ignore[attr-defined]
+    out = model(features, current)
+    return out, {}
+
+
+def make_features(noisy: torch.Tensor, current: torch.Tensor, feature_set: str = "basic") -> torch.Tensor:
     y = (current * torch.tensor([0.299, 0.587, 0.114], device=current.device, dtype=current.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
     chroma = current - y
     chroma_mag = torch.sqrt(torch.clamp((chroma * chroma).sum(1, keepdim=True), min=1.0e-8))
     residual = noisy - current
-    return torch.cat([noisy, current, residual, y, chroma_mag], dim=1)
+    features = [noisy, current, residual, y, chroma_mag]
+    if feature_set == "texture":
+        noisy_y = (noisy * torch.tensor([0.299, 0.587, 0.114], device=noisy.device, dtype=noisy.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
+        noisy_chroma = noisy - noisy_y
+        noisy_chroma_mag = torch.sqrt(torch.clamp((noisy_chroma * noisy_chroma).sum(1, keepdim=True), min=1.0e-8))
+        residual_y = (residual * torch.tensor([0.299, 0.587, 0.114], device=residual.device, dtype=residual.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
+        residual_chroma = residual - residual_y
+        residual_chroma_mag = torch.sqrt(torch.clamp((residual_chroma * residual_chroma).sum(1, keepdim=True), min=1.0e-8))
+        y_detail = torch.abs(y - F.avg_pool2d(y, kernel_size=7, stride=1, padding=3))
+        chroma_hf = torch.abs(chroma_mag - F.avg_pool2d(chroma_mag, kernel_size=7, stride=1, padding=3))
+        noisy_chroma_hf = torch.abs(noisy_chroma_mag - F.avg_pool2d(noisy_chroma_mag, kernel_size=7, stride=1, padding=3))
+        features.extend([y_detail, chroma_hf, noisy_chroma_hf, residual_chroma_mag])
+    elif feature_set != "basic":
+        raise ValueError(f"unknown feature set: {feature_set}")
+    return torch.cat(features, dim=1)
 
 
 class CropDataset(torch.utils.data.Dataset):
@@ -311,14 +377,44 @@ def choose_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def load_model(checkpoint: str | Path, device: torch.device) -> PilotRefiner:
+def feature_channels(feature_set: str) -> int:
+    if feature_set == "basic":
+        return 11
+    if feature_set == "texture":
+        return 15
+    raise ValueError(f"unknown feature set: {feature_set}")
+
+
+def create_model(kind: str, width: int, blocks: int, max_delta: float, feature_set: str = "basic") -> nn.Module:
+    if kind == "residual":
+        model: nn.Module = PilotRefiner(width=width, blocks=blocks, max_delta=max_delta, in_channels=feature_channels(feature_set))
+        model.feature_set = feature_set  # type: ignore[attr-defined]
+        return model
+    if kind == "gated":
+        model = GatedPilotRefiner(width=width, blocks=blocks, max_delta=max_delta, in_channels=feature_channels(feature_set))
+        model.feature_set = feature_set  # type: ignore[attr-defined]
+        return model
+    if kind == "chroma":
+        model = ChromaPilotRefiner(width=width, blocks=blocks, max_delta=max_delta, in_channels=feature_channels(feature_set))
+        model.feature_set = feature_set  # type: ignore[attr-defined]
+        return model
+    raise ValueError(f"unknown model kind: {kind}")
+
+
+def load_model(checkpoint: str | Path, device: torch.device) -> nn.Module:
     try:
         ckpt = torch.load(checkpoint, map_location="cpu")
     except pickle.UnpicklingError:
         # Backward compatibility for the first pilot checkpoint, which stored
         # argparse's subcommand function object in args.
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    model = PilotRefiner(width=int(ckpt["width"]), blocks=int(ckpt["blocks"]), max_delta=float(ckpt["max_delta"]))
+    model = create_model(
+        str(ckpt.get("model_kind", "residual")),
+        width=int(ckpt["width"]),
+        blocks=int(ckpt["blocks"]),
+        max_delta=float(ckpt["max_delta"]),
+        feature_set=str(ckpt.get("feature_set", "basic")),
+    )
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval()
 
@@ -331,7 +427,7 @@ def train(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     ds = CropDataset(Path(args.crop_dir), args.patch_size, args.iters * args.batch_size, args.seed)
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, drop_last=True)
-    model = PilotRefiner(width=args.width, blocks=args.blocks, max_delta=args.max_delta).to(device)
+    model = create_model(args.model_kind, width=args.width, blocks=args.blocks, max_delta=args.max_delta, feature_set=args.feature_set).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
 
     log_path = out_dir / "stdout.log"
@@ -347,7 +443,7 @@ def train(args: argparse.Namespace) -> None:
             weak = batch["weak"].to(device)
             protect = batch["protect"].to(device)
             noise_gate = batch["noise_gate"].to(device)
-            pred = model(make_features(noisy, current), current)
+            pred, aux = refine_with_aux(model, noisy, current)
 
             weak_w = 0.08 + weak * args.weak_weight * (1.0 + noise_gate * args.noise_gate_weight)
             protect_w = protect * args.protect_weight
@@ -355,8 +451,9 @@ def train(args: argparse.Namespace) -> None:
             loss_identity = (torch.abs(pred - current) * (protect_w + args.identity_weight)).mean()
             loss_chroma = chroma_loss(pred, teacher, weak) * args.chroma_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
+            loss_gate = gate_loss(aux.get("gate"), weak, protect, noise_gate, args.gate_weight, args.gate_sparsity_weight)
             loss_tv = total_variation(pred - current) * args.tv_weight
-            loss = args.teacher_rgb_weight * loss_teacher + loss_identity + loss_chroma + loss_luma_identity + loss_tv
+            loss = args.teacher_rgb_weight * loss_teacher + loss_identity + loss_chroma + loss_luma_identity + loss_gate + loss_tv
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -367,6 +464,7 @@ def train(args: argparse.Namespace) -> None:
                     f"step {step:05d}/{args.iters} loss={float(loss.detach()):.6f} "
                     f"teacher={float(loss_teacher.detach()):.6f} identity={float(loss_identity.detach()):.6f} "
                     f"chroma={float(loss_chroma.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
+                    f"gate={float(loss_gate.detach()):.6f} "
                     f"tv={float(loss_tv.detach()):.6f} "
                     f"{elapsed / step:.3f}s/it"
                 )
@@ -376,6 +474,8 @@ def train(args: argparse.Namespace) -> None:
         ckpt = {
             "model": model.state_dict(),
             "args": {k: v for k, v in vars(args).items() if isinstance(v, (str, int, float, bool, type(None)))},
+            "model_kind": args.model_kind,
+            "feature_set": args.feature_set,
             "width": args.width,
             "blocks": args.blocks,
             "max_delta": args.max_delta,
@@ -401,6 +501,22 @@ def luma_identity_loss(pred: torch.Tensor, current: torch.Tensor, protect: torch
     return (torch.abs(yp - yc) * weight).mean()
 
 
+def gate_loss(
+    gate: torch.Tensor | None,
+    weak: torch.Tensor,
+    protect: torch.Tensor,
+    noise_gate: torch.Tensor,
+    weight: float,
+    sparsity_weight: float,
+) -> torch.Tensor:
+    if gate is None:
+        return torch.zeros((), device=weak.device, dtype=weak.dtype)
+    target = torch.clamp((weak * 0.75 + noise_gate * 0.45) * (1.0 - protect * 0.75), 0.0, 1.0)
+    supervised = F.smooth_l1_loss(gate, target, reduction="mean") * float(weight)
+    sparsity = (gate * (0.25 + protect * 1.50)).mean() * float(sparsity_weight)
+    return supervised + sparsity
+
+
 def total_variation(x: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])) + torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
 
@@ -420,12 +536,15 @@ def apply_crops(args: argparse.Namespace) -> None:
         teacher = item["teacher"].astype(np.float32)
         inp_noisy = torch.from_numpy(np.transpose(noisy, (2, 0, 1))[None]).to(device)
         inp_current = torch.from_numpy(np.transpose(current, (2, 0, 1))[None]).to(device)
-        pred = model(make_features(inp_noisy, inp_current), inp_current)
+        pred, aux = refine_with_aux(model, inp_noisy, inp_current)
         out = np.transpose(pred.squeeze(0).cpu().numpy(), (1, 2, 0))
         stem = path.stem
         rows.append((stem, noisy, current, out, teacher))
         write_exr(out_dir / f"{stem}_refined.exr", srgb_to_linear(out))
         write_tiff(out_dir / f"{stem}_refined.tiff", srgb_to_linear(out))
+        if "gate" in aux:
+            gate = aux["gate"].squeeze().cpu().numpy()
+            Image.fromarray((np.clip(gate, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(out_dir / f"{stem}_gate.png")
     make_contact_sheets(rows, out_dir, max_rows=args.max_rows)
     print(f"wrote refined crops and contact sheets to {out_dir}")
 
@@ -506,7 +625,7 @@ def apply_full(args: argparse.Namespace) -> None:
             c = current[y0 : y0 + args.tile_size, x0 : x0 + args.tile_size]
             inp_noisy = torch.from_numpy(np.transpose(np.ascontiguousarray(n), (2, 0, 1))[None]).to(device)
             inp_current = torch.from_numpy(np.transpose(np.ascontiguousarray(c), (2, 0, 1))[None]).to(device)
-            pred = model(make_features(inp_noisy, inp_current), inp_current)
+            pred, aux = refine_with_aux(model, inp_noisy, inp_current)
             refined = np.transpose(pred.squeeze(0).cpu().numpy(), (1, 2, 0))
             if args.strength != 1.0:
                 refined = np.clip(c + (refined - c) * float(args.strength), 0.0, 1.0)
@@ -547,6 +666,12 @@ def apply_full(args: argparse.Namespace) -> None:
         "current_luma_hf_p99": luma_hf_p99(current),
         "refined_luma_hf_p99": luma_hf_p99(refined_srgb),
     }
+    if isinstance(model, GatedPilotRefiner):
+        meta["model_kind"] = "gated"
+    elif isinstance(model, ChromaPilotRefiner):
+        meta["model_kind"] = "chroma"
+    else:
+        meta["model_kind"] = "residual"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))
     print(f"wrote {exr_path}")
@@ -602,6 +727,8 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=600)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=160)
+    p.add_argument("--model-kind", choices=["residual", "gated", "chroma"], default="residual")
+    p.add_argument("--feature-set", choices=["basic", "texture"], default="basic")
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--max-delta", type=float, default=0.050)
@@ -614,6 +741,8 @@ def main() -> None:
     p.add_argument("--chroma-weight", type=float, default=1.2)
     p.add_argument("--luma-change-weight", type=float, default=0.0)
     p.add_argument("--luma-protect-weight", type=float, default=3.0)
+    p.add_argument("--gate-weight", type=float, default=0.0)
+    p.add_argument("--gate-sparsity-weight", type=float, default=0.0)
     p.add_argument("--tv-weight", type=float, default=0.035)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=11)
