@@ -121,6 +121,7 @@ train-nagiperfect-s-strictflat-2k = "python scripts/launch_perfect_training.py p
 train-nagiperfect-s-hlguard-1k = "python scripts/launch_perfect_training.py perfect_s_hlguard_1k"
 train-nagiperfect-s-magentadot-2k = "python scripts/launch_perfect_training.py perfect_s_weakteacher_magentadot_2k"
 train-nagiperfect-s-magentadot-weakonly-1k = "python scripts/launch_perfect_training.py perfect_s_weakteacher_magentadot_weakonly_1k"
+train-nagiperfect-s-axiscleanup-1k = "python scripts/launch_perfect_training.py perfect_s_weakteacher_axiscleanup_1k"
 train-nagiperfect-s-axisneutral-2k = "python scripts/launch_perfect_training.py perfect_s_weakteacher_axisneutral_2k"
 train-nagiperfect-s-pilot-500 = "python scripts/launch_perfect_training.py perfect_s_pilot_500"
 train-nagiperfect-s-stable-2k = "python scripts/launch_perfect_training.py perfect_s_stable_2k"
