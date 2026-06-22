@@ -450,6 +450,24 @@ def main() -> None:
         default="off",
         help="Extra display-chroma guard after tail luma cleanup.",
     )
+    parser.add_argument(
+        "--post-extra-chroma-speckle-preset",
+        choices=sorted(POST_CHROMA_SPECKLE_PRESETS),
+        default="off",
+        help="Optional additional chroma guard after the legacy tail cleanup.",
+    )
+    parser.add_argument(
+        "--post-extra-luma-hf-preset",
+        choices=sorted(POST_LUMA_HF_PRESETS),
+        default="off",
+        help="Optional additional luma cleanup after the extra chroma guard.",
+    )
+    parser.add_argument(
+        "--post-extra-final-chroma-speckle-preset",
+        choices=sorted(POST_CHROMA_SPECKLE_PRESETS),
+        default="off",
+        help="Optional final chroma guard after extra luma cleanup.",
+    )
     parser.add_argument("--luma-smooth-strength", type=float, default=None)
     parser.add_argument("--luma-smooth-gate-bias", type=float, default=None)
     parser.add_argument("--tile-size", type=int, default=0)
@@ -540,6 +558,29 @@ def main() -> None:
         output, post_tail_chroma_speckle_stats, post_tail_chroma_speckle_blend = apply_chroma_speckle_preset(
             output, image, post_tail_chroma_speckle_source
         )
+    post_extra_chroma_speckle_stats = None
+    post_extra_chroma_speckle_blend = None
+    post_extra_chroma_speckle_source = POST_CHROMA_SPECKLE_PRESETS[args.post_extra_chroma_speckle_preset]
+    if post_extra_chroma_speckle_source is not None:
+        output, post_extra_chroma_speckle_stats, post_extra_chroma_speckle_blend = apply_chroma_speckle_preset(
+            output, image, post_extra_chroma_speckle_source
+        )
+    post_extra_luma_hf_stats = None
+    post_extra_luma_hf_gate = None
+    post_extra_luma_hf_source = POST_LUMA_HF_PRESETS[args.post_extra_luma_hf_preset]
+    if post_extra_luma_hf_source is not None:
+        output, post_extra_luma_hf_stats, post_extra_luma_hf_gate = apply_luma_hf_preset(
+            output, image, post_extra_luma_hf_source
+        )
+    post_extra_final_chroma_speckle_stats = None
+    post_extra_final_chroma_speckle_blend = None
+    post_extra_final_chroma_speckle_source = POST_CHROMA_SPECKLE_PRESETS[
+        args.post_extra_final_chroma_speckle_preset
+    ]
+    if post_extra_final_chroma_speckle_source is not None:
+        output, post_extra_final_chroma_speckle_stats, post_extra_final_chroma_speckle_blend = (
+            apply_chroma_speckle_preset(output, image, post_extra_final_chroma_speckle_source)
+        )
 
     exr_path = out_dir / f"{name}_nagiperfect.exr"
     tiff_path = out_dir / f"{name}_nagiperfect.tiff"
@@ -553,6 +594,9 @@ def main() -> None:
     luma_hf_gate_path = out_dir / f"{name}_post_luma_hf_gate.png"
     tail_luma_hf_gate_path = out_dir / f"{name}_post_tail_luma_hf_gate.png"
     tail_chroma_speckle_blend_path = out_dir / f"{name}_post_tail_chroma_speckle_blend.png"
+    extra_chroma_speckle_blend_path = out_dir / f"{name}_post_extra_chroma_speckle_blend.png"
+    extra_luma_hf_gate_path = out_dir / f"{name}_post_extra_luma_hf_gate.png"
+    extra_final_chroma_speckle_blend_path = out_dir / f"{name}_post_extra_final_chroma_speckle_blend.png"
     json_path = out_dir / f"{name}_nagiperfect.json"
 
     write_exr(exr_path, output)
@@ -594,6 +638,18 @@ def main() -> None:
         Image.fromarray(
             (np.clip(post_tail_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
         ).save(tail_chroma_speckle_blend_path)
+    if post_extra_chroma_speckle_blend is not None:
+        Image.fromarray(
+            (np.clip(post_extra_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        ).save(extra_chroma_speckle_blend_path)
+    if post_extra_luma_hf_gate is not None:
+        Image.fromarray((np.clip(post_extra_luma_hf_gate, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(
+            extra_luma_hf_gate_path
+        )
+    if post_extra_final_chroma_speckle_blend is not None:
+        Image.fromarray(
+            (np.clip(post_extra_final_chroma_speckle_blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        ).save(extra_final_chroma_speckle_blend_path)
 
     meta = {
         "input": str(input_path),
@@ -616,6 +672,13 @@ def main() -> None:
             "post_tail_luma_hf_gate": str(tail_luma_hf_gate_path) if post_tail_luma_hf_gate is not None else None,
             "post_tail_chroma_speckle_blend": str(tail_chroma_speckle_blend_path)
             if post_tail_chroma_speckle_blend is not None
+            else None,
+            "post_extra_chroma_speckle_blend": str(extra_chroma_speckle_blend_path)
+            if post_extra_chroma_speckle_blend is not None
+            else None,
+            "post_extra_luma_hf_gate": str(extra_luma_hf_gate_path) if post_extra_luma_hf_gate is not None else None,
+            "post_extra_final_chroma_speckle_blend": str(extra_final_chroma_speckle_blend_path)
+            if post_extra_final_chroma_speckle_blend is not None
             else None,
         },
         "input_stats": image_stats(image),
@@ -675,6 +738,21 @@ def main() -> None:
             "preset": args.post_tail_chroma_speckle_preset,
             "source_preset": post_tail_chroma_speckle_source,
             "stats": post_tail_chroma_speckle_stats,
+        },
+        "post_extra_chroma_speckle": {
+            "preset": args.post_extra_chroma_speckle_preset,
+            "source_preset": post_extra_chroma_speckle_source,
+            "stats": post_extra_chroma_speckle_stats,
+        },
+        "post_extra_luma_hf": {
+            "preset": args.post_extra_luma_hf_preset,
+            "source_preset": post_extra_luma_hf_source,
+            "stats": post_extra_luma_hf_stats,
+        },
+        "post_extra_final_chroma_speckle": {
+            "preset": args.post_extra_final_chroma_speckle_preset,
+            "source_preset": post_extra_final_chroma_speckle_source,
+            "stats": post_extra_final_chroma_speckle_stats,
         },
         "tiling": {
             "tile_size": int(args.tile_size),
