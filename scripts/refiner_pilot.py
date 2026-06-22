@@ -592,6 +592,20 @@ def train(args: argparse.Namespace) -> None:
             loss_chroma = chroma_loss(pred, teacher, chroma_w) * args.chroma_weight
             loss_magenta_axis = chroma_axis_loss(pred, teacher, magenta_dot_gate, [0.5, -1.0, 0.5]) * args.magenta_axis_weight
             loss_blue_axis = chroma_axis_loss(pred, teacher, blue_dot_gate, [-0.5, -0.5, 1.0]) * args.blue_axis_weight
+            loss_magenta_tail = chroma_axis_tail_loss(
+                pred,
+                teacher,
+                magenta_dot_gate,
+                [0.5, -1.0, 0.5],
+                args.axis_tail_fraction,
+            ) * args.magenta_axis_tail_weight
+            loss_blue_tail = chroma_axis_tail_loss(
+                pred,
+                teacher,
+                blue_dot_gate,
+                [-0.5, -0.5, 1.0],
+                args.axis_tail_fraction,
+            ) * args.blue_axis_tail_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
             loss_luma_dot = luma_teacher_loss(pred, teacher, dark_luma_dot_gate) * args.luma_dot_weight
             loss_luma_delta_sparse = luma_delta_loss(aux.get("luma_delta"), dark_luma_dot_gate, protect) * args.luma_dot_sparsity_weight
@@ -603,6 +617,8 @@ def train(args: argparse.Namespace) -> None:
                 + loss_chroma
                 + loss_magenta_axis
                 + loss_blue_axis
+                + loss_magenta_tail
+                + loss_blue_tail
                 + loss_luma_identity
                 + loss_luma_dot
                 + loss_luma_delta_sparse
@@ -619,7 +635,8 @@ def train(args: argparse.Namespace) -> None:
                     f"step {step:05d}/{args.iters} loss={float(loss.detach()):.6f} "
                     f"teacher={float(loss_teacher.detach()):.6f} identity={float(loss_identity.detach()):.6f} "
                     f"chroma={float(loss_chroma.detach()):.6f} mag_axis={float(loss_magenta_axis.detach()):.6f} "
-                    f"blue_axis={float(loss_blue_axis.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
+                    f"blue_axis={float(loss_blue_axis.detach()):.6f} mag_tail={float(loss_magenta_tail.detach()):.6f} "
+                    f"blue_tail={float(loss_blue_tail.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
                     f"luma_dot={float(loss_luma_dot.detach()):.6f} luma_sparse={float(loss_luma_delta_sparse.detach()):.6f} "
                     f"gate={float(loss_gate.detach()):.6f} "
                     f"tv={float(loss_tv.detach()):.6f} "
@@ -660,6 +677,26 @@ def chroma_axis_loss(pred: torch.Tensor, teacher: torch.Tensor, weight: torch.Te
     pred_axis = (pred_chroma * ax).sum(1, keepdim=True)
     teacher_axis = (teacher_chroma * ax).sum(1, keepdim=True)
     return (torch.abs(pred_axis - teacher_axis) * weight).mean()
+
+
+def chroma_axis_tail_loss(
+    pred: torch.Tensor,
+    teacher: torch.Tensor,
+    weight: torch.Tensor,
+    axis: list[float],
+    fraction: float,
+) -> torch.Tensor:
+    wp = torch.tensor([0.299, 0.587, 0.114], device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    ax = torch.tensor(axis, device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    ax = ax / torch.clamp(torch.sqrt(torch.sum(ax * ax)), min=1.0e-6)
+    pred_chroma = pred - (pred * wp).sum(1, keepdim=True)
+    teacher_chroma = teacher - (teacher * wp).sum(1, keepdim=True)
+    err = torch.abs(((pred_chroma - teacher_chroma) * ax).sum(1, keepdim=True)) * weight
+    flat = err.reshape(-1)
+    if flat.numel() == 0:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    k = max(1, min(flat.numel(), int(round(flat.numel() * float(fraction)))))
+    return torch.topk(flat, k=k, largest=True, sorted=False).values.mean()
 
 
 def luma_identity_loss(pred: torch.Tensor, current: torch.Tensor, protect: torch.Tensor, protect_weight: float) -> torch.Tensor:
@@ -935,6 +972,9 @@ def main() -> None:
     p.add_argument("--chroma-weight", type=float, default=1.2)
     p.add_argument("--magenta-axis-weight", type=float, default=0.0)
     p.add_argument("--blue-axis-weight", type=float, default=0.0)
+    p.add_argument("--magenta-axis-tail-weight", type=float, default=0.0)
+    p.add_argument("--blue-axis-tail-weight", type=float, default=0.0)
+    p.add_argument("--axis-tail-fraction", type=float, default=0.015)
     p.add_argument("--luma-change-weight", type=float, default=0.0)
     p.add_argument("--luma-protect-weight", type=float, default=3.0)
     p.add_argument("--luma-dot-weight", type=float, default=0.0)
