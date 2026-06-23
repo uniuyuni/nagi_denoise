@@ -460,7 +460,7 @@ def make_features(noisy: torch.Tensor, current: torch.Tensor, feature_set: str =
         chroma_hf = torch.abs(chroma_mag - F.avg_pool2d(chroma_mag, kernel_size=7, stride=1, padding=3))
         noisy_chroma_hf = torch.abs(noisy_chroma_mag - F.avg_pool2d(noisy_chroma_mag, kernel_size=7, stride=1, padding=3))
         features.extend([y_detail, chroma_hf, noisy_chroma_hf, residual_chroma_mag])
-    elif feature_set == "texture_gates":
+    elif feature_set in {"texture_gates", "texture_signed_gates"}:
         noisy_y = (noisy * torch.tensor([0.299, 0.587, 0.114], device=noisy.device, dtype=noisy.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
         noisy_chroma = noisy - noisy_y
         noisy_chroma_mag = torch.sqrt(torch.clamp((noisy_chroma * noisy_chroma).sum(1, keepdim=True), min=1.0e-8))
@@ -474,20 +474,28 @@ def make_features(noisy: torch.Tensor, current: torch.Tensor, feature_set: str =
         dark = dark * dark * (3.0 - 2.0 * dark)
         chroma_dot = torch.clamp((torch.maximum(chroma_hf, noisy_chroma_hf) - 0.016) / 0.032, 0.0, 1.0)
 
-        def axis_gate(axis: list[float]) -> torch.Tensor:
+        def axis_hf(axis: list[float]) -> tuple[torch.Tensor, torch.Tensor]:
             ax = torch.tensor(axis, device=current.device, dtype=current.dtype).view(1, 3, 1, 1)
             ax = ax / torch.clamp(torch.sqrt(torch.sum(ax * ax)), min=1.0e-6)
             cur_axis = (chroma * ax).sum(1, keepdim=True)
             noisy_axis = (noisy_chroma * ax).sum(1, keepdim=True)
-            cur_hf = torch.abs(cur_axis - F.avg_pool2d(cur_axis, kernel_size=7, stride=1, padding=3))
-            noi_hf = torch.abs(noisy_axis - F.avg_pool2d(noisy_axis, kernel_size=7, stride=1, padding=3))
-            axis_dot = torch.clamp((torch.maximum(cur_hf, noi_hf) - 0.007) / 0.022, 0.0, 1.0)
+            cur_hf = cur_axis - F.avg_pool2d(cur_axis, kernel_size=7, stride=1, padding=3)
+            noi_hf = noisy_axis - F.avg_pool2d(noisy_axis, kernel_size=7, stride=1, padding=3)
+            return cur_hf, noi_hf
+
+        def axis_gate(axis: list[float]) -> torch.Tensor:
+            cur_hf, noi_hf = axis_hf(axis)
+            axis_dot = torch.clamp((torch.maximum(torch.abs(cur_hf), torch.abs(noi_hf)) - 0.007) / 0.022, 0.0, 1.0)
             return dark * chroma_dot * axis_dot
 
+        magenta_hf, noisy_magenta_hf = axis_hf([0.5, -1.0, 0.5])
+        blue_hf, noisy_blue_hf = axis_hf([-0.5, -0.5, 1.0])
         magenta_gate = axis_gate([0.5, -1.0, 0.5])
         blue_gate = axis_gate([-0.5, -0.5, 1.0])
         luma_dot = dark * torch.clamp((y_detail - 0.014) / 0.034, 0.0, 1.0)
         features.extend([y_detail, chroma_hf, noisy_chroma_hf, residual_chroma_mag, dark * chroma_dot, magenta_gate, blue_gate, luma_dot])
+        if feature_set == "texture_signed_gates":
+            features.extend([magenta_hf, noisy_magenta_hf, blue_hf, noisy_blue_hf])
     elif feature_set != "basic":
         raise ValueError(f"unknown feature set: {feature_set}")
     return torch.cat(features, dim=1)
@@ -551,6 +559,8 @@ def feature_channels(feature_set: str) -> int:
         return 15
     if feature_set == "texture_gates":
         return 19
+    if feature_set == "texture_signed_gates":
+        return 23
     raise ValueError(f"unknown feature set: {feature_set}")
 
 
@@ -1021,7 +1031,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=160)
     p.add_argument("--model-kind", choices=["residual", "gated", "chroma", "chroma_luma_dot"], default="residual")
-    p.add_argument("--feature-set", choices=["basic", "texture", "texture_gates"], default="basic")
+    p.add_argument("--feature-set", choices=["basic", "texture", "texture_gates", "texture_signed_gates"], default="basic")
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--max-delta", type=float, default=0.050)
