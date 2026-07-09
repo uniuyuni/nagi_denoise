@@ -324,6 +324,7 @@ def main() -> None:
     parser.add_argument("--guide-input", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--name", default=None)
+    parser.add_argument("--no-tiff", action="store_true")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="strong")
     parser.add_argument("--strength", type=float, default=None)
     parser.add_argument("--low-sigma", type=float, default=None)
@@ -424,7 +425,8 @@ def main() -> None:
     meta_path = out_dir / f"{name}.json"
 
     write_exr(exr_path, out)
-    write_tiff(tiff_path, out)
+    if not args.no_tiff:
+        write_tiff(tiff_path, out)
     Image.fromarray(make_preview(out, exposure=1.0, tone="reinhard")).save(preview_path)
     Image.fromarray(np.clip(shrink_gate * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(gate_path)
     meta = {
@@ -432,7 +434,12 @@ def main() -> None:
         "guide_input": str(guide_path),
         "preset": args.preset,
         "params": params,
-        "outputs": {"exr": str(exr_path), "tiff": str(tiff_path), "preview": str(preview_path), "gate": str(gate_path)},
+        "outputs": {
+            "exr": str(exr_path),
+            "tiff": None if args.no_tiff else str(tiff_path),
+            "preview": str(preview_path),
+            "gate": str(gate_path),
+        },
         "filter": stats,
         "input_stats": image_stats(image),
         "output_stats": image_stats(out),

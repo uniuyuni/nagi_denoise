@@ -30,7 +30,7 @@ from perfect_nr_probe import read_image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_PHOTOS = Path("/Users/uniuyuni/PythonProjects/test_photos")
+TEST_PHOTOS = Path("/Users/uniuyuni/ProjectData/test_photos")
 LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
@@ -435,6 +435,37 @@ class ChromaLumaDotRefiner(nn.Module):
         return out
 
 
+class LumaDetailGateRefiner(nn.Module):
+    def __init__(
+        self,
+        width: int = 32,
+        blocks: int = 5,
+        max_delta: float = 0.0,
+        max_luma_delta: float = 0.050,
+        in_channels: int = 15,
+    ) -> None:
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.max_luma_delta = float(max_luma_delta)
+        self.head = nn.Conv2d(in_channels, width, 3, padding=1)
+        self.body = nn.Sequential(*[ResidualBlock(width) for _ in range(blocks)])
+        self.detail_tail = nn.Conv2d(width, 1, 3, padding=1)
+        self.gate_tail = nn.Conv2d(width, 1, 3, padding=1)
+
+    def forward_with_aux(self, features: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        z = self.body(F.gelu(self.head(features)))
+        raw_detail = torch.tanh(self.detail_tail(z)) * self.max_luma_delta
+        detail = raw_detail - F.avg_pool2d(raw_detail, kernel_size=9, stride=1, padding=4)
+        gate = torch.sigmoid(self.gate_tail(z))
+        luma_delta = detail * gate
+        out = torch.clamp(current + luma_delta, 0.0, 1.0)
+        return out, {"gate": gate, "luma_delta": luma_delta, "raw_luma_detail": detail}
+
+    def forward(self, features: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+        out, _ = self.forward_with_aux(features, current)
+        return out
+
+
 def refine_with_aux(model: nn.Module, noisy: torch.Tensor, current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     features = make_features(noisy, current, getattr(model, "feature_set", "basic"))
     if hasattr(model, "forward_with_aux"):
@@ -460,7 +491,7 @@ def make_features(noisy: torch.Tensor, current: torch.Tensor, feature_set: str =
         chroma_hf = torch.abs(chroma_mag - F.avg_pool2d(chroma_mag, kernel_size=7, stride=1, padding=3))
         noisy_chroma_hf = torch.abs(noisy_chroma_mag - F.avg_pool2d(noisy_chroma_mag, kernel_size=7, stride=1, padding=3))
         features.extend([y_detail, chroma_hf, noisy_chroma_hf, residual_chroma_mag])
-    elif feature_set in {"texture_gates", "texture_signed_gates"}:
+    elif feature_set in {"texture_gates", "texture_signed_gates", "texture_line_gates"}:
         noisy_y = (noisy * torch.tensor([0.299, 0.587, 0.114], device=noisy.device, dtype=noisy.dtype).view(1, 3, 1, 1)).sum(1, keepdim=True)
         noisy_chroma = noisy - noisy_y
         noisy_chroma_mag = torch.sqrt(torch.clamp((noisy_chroma * noisy_chroma).sum(1, keepdim=True), min=1.0e-8))
@@ -494,8 +525,31 @@ def make_features(noisy: torch.Tensor, current: torch.Tensor, feature_set: str =
         blue_gate = axis_gate([-0.5, -0.5, 1.0])
         luma_dot = dark * torch.clamp((y_detail - 0.014) / 0.034, 0.0, 1.0)
         features.extend([y_detail, chroma_hf, noisy_chroma_hf, residual_chroma_mag, dark * chroma_dot, magenta_gate, blue_gate, luma_dot])
-        if feature_set == "texture_signed_gates":
+        if feature_set in {"texture_signed_gates", "texture_line_gates"}:
             features.extend([magenta_hf, noisy_magenta_hf, blue_hf, noisy_blue_hf])
+        if feature_set == "texture_line_gates":
+            kx = torch.tensor(
+                [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+                device=current.device,
+                dtype=current.dtype,
+            ).view(1, 1, 3, 3) / 8.0
+            ky = kx.transpose(2, 3)
+
+            def line_features(src_y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                signed_hf = src_y - F.avg_pool2d(src_y, kernel_size=7, stride=1, padding=3)
+                gx = F.conv2d(src_y, kx, padding=1)
+                gy = F.conv2d(src_y, ky, padding=1)
+                mag = torch.sqrt(torch.clamp(gx * gx + gy * gy, min=1.0e-8))
+                jxx = F.avg_pool2d(gx * gx, kernel_size=5, stride=1, padding=2)
+                jyy = F.avg_pool2d(gy * gy, kernel_size=5, stride=1, padding=2)
+                jxy = F.avg_pool2d(gx * gy, kernel_size=5, stride=1, padding=2)
+                coherence = torch.sqrt(torch.clamp((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy, min=0.0)) / torch.clamp(
+                    jxx + jyy, min=1.0e-6
+                )
+                line_score = torch.clamp((mag - 0.006) / 0.035, 0.0, 1.0) * torch.clamp((coherence - 0.10) / 0.60, 0.0, 1.0)
+                return signed_hf, mag, coherence, line_score
+
+            features.extend([*line_features(y), *line_features(noisy_y)])
     elif feature_set != "basic":
         raise ValueError(f"unknown feature set: {feature_set}")
     return torch.cat(features, dim=1)
@@ -539,6 +593,8 @@ class CropDataset(torch.utils.data.Dataset):
             "magenta_dot_gate": take("magenta_dot_gate", False) if "magenta_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
             "blue_dot_gate": take("blue_dot_gate", False) if "blue_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
             "dark_luma_dot_gate": take("dark_luma_dot_gate", False) if "dark_luma_dot_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
+            "detail_gate": take("detail_gate", False) if "detail_gate" in item else take("weak", False),
+            "line_restore_gate": take("line_restore_gate", False) if "line_restore_gate" in item else torch.zeros((1, self.patch, self.patch), dtype=torch.float32),
         }
 
 
@@ -561,6 +617,8 @@ def feature_channels(feature_set: str) -> int:
         return 19
     if feature_set == "texture_signed_gates":
         return 23
+    if feature_set == "texture_line_gates":
+        return 31
     raise ValueError(f"unknown feature set: {feature_set}")
 
 
@@ -586,6 +644,16 @@ def create_model(
         return model
     if kind == "chroma_luma_dot":
         model = ChromaLumaDotRefiner(
+            width=width,
+            blocks=blocks,
+            max_delta=max_delta,
+            max_luma_delta=max_luma_delta,
+            in_channels=feature_channels(feature_set),
+        )
+        model.feature_set = feature_set  # type: ignore[attr-defined]
+        return model
+    if kind == "luma_detail_gate":
+        model = LumaDetailGateRefiner(
             width=width,
             blocks=blocks,
             max_delta=max_delta,
@@ -651,6 +719,8 @@ def train(args: argparse.Namespace) -> None:
             magenta_dot_gate = batch["magenta_dot_gate"].to(device)
             blue_dot_gate = batch["blue_dot_gate"].to(device)
             dark_luma_dot_gate = batch["dark_luma_dot_gate"].to(device)
+            detail_gate = batch["detail_gate"].to(device)
+            line_restore_gate = batch["line_restore_gate"].to(device)
             pred, aux = refine_with_aux(model, noisy, current)
 
             color_axis_gate = magenta_dot_gate * args.magenta_dot_weight + blue_dot_gate * args.blue_dot_weight
@@ -688,8 +758,12 @@ def train(args: argparse.Namespace) -> None:
             ) * args.blue_axis_tail_weight
             loss_luma_identity = luma_identity_loss(pred, current, protect, args.luma_protect_weight) * args.luma_change_weight
             loss_luma_dot = luma_teacher_loss(pred, teacher, dark_luma_dot_gate) * args.luma_dot_weight
+            loss_luma_detail = signed_luma_detail_loss(aux.get("luma_delta"), pred, current, teacher, weak) * args.luma_detail_weight
+            loss_luma_gradient = luma_gradient_loss(pred, teacher, weak) * args.luma_gradient_weight
+            loss_line_restore = luma_teacher_loss(pred, teacher, line_restore_gate) * args.line_restore_weight
             loss_luma_delta_sparse = luma_delta_loss(aux.get("luma_delta"), dark_luma_dot_gate, protect) * args.luma_dot_sparsity_weight
             loss_gate = gate_loss(aux.get("gate"), weak, protect, noise_gate, args.gate_weight, args.gate_sparsity_weight)
+            loss_detail_gate = direct_gate_loss(aux.get("gate"), detail_gate) * args.detail_gate_weight
             loss_tv = total_variation(pred - current) * args.tv_weight
             loss = (
                 args.teacher_rgb_weight * loss_teacher
@@ -701,8 +775,12 @@ def train(args: argparse.Namespace) -> None:
                 + loss_blue_tail
                 + loss_luma_identity
                 + loss_luma_dot
+                + loss_luma_detail
+                + loss_luma_gradient
+                + loss_line_restore
                 + loss_luma_delta_sparse
                 + loss_gate
+                + loss_detail_gate
                 + loss_tv
             )
             opt.zero_grad(set_to_none=True)
@@ -717,13 +795,32 @@ def train(args: argparse.Namespace) -> None:
                     f"chroma={float(loss_chroma.detach()):.6f} mag_axis={float(loss_magenta_axis.detach()):.6f} "
                     f"blue_axis={float(loss_blue_axis.detach()):.6f} mag_tail={float(loss_magenta_tail.detach()):.6f} "
                     f"blue_tail={float(loss_blue_tail.detach()):.6f} luma_id={float(loss_luma_identity.detach()):.6f} "
-                    f"luma_dot={float(loss_luma_dot.detach()):.6f} luma_sparse={float(loss_luma_delta_sparse.detach()):.6f} "
-                    f"gate={float(loss_gate.detach()):.6f} "
+                    f"luma_dot={float(loss_luma_dot.detach()):.6f} luma_detail={float(loss_luma_detail.detach()):.6f} "
+                    f"luma_grad={float(loss_luma_gradient.detach()):.6f} "
+                    f"line_restore={float(loss_line_restore.detach()):.6f} "
+                    f"luma_sparse={float(loss_luma_delta_sparse.detach()):.6f} "
+                    f"gate={float(loss_gate.detach()):.6f} detail_gate={float(loss_detail_gate.detach()):.6f} "
                     f"tv={float(loss_tv.detach()):.6f} "
                     f"{elapsed / step:.3f}s/it"
                 )
                 print(msg)
                 log.write(msg + "\n")
+                log.flush()
+            if args.save_every > 0 and step % args.save_every == 0:
+                ckpt = {
+                    "model": model.state_dict(),
+                    "args": {k: v for k, v in vars(args).items() if isinstance(v, (str, int, float, bool, type(None)))},
+                    "model_kind": args.model_kind,
+                    "feature_set": args.feature_set,
+                    "width": args.width,
+                    "blocks": args.blocks,
+                    "max_delta": args.max_delta,
+                    "max_luma_delta": args.max_luma_delta,
+                    "step": step,
+                }
+                ckpt_path = out_dir / f"refiner_pilot_step_{step:06d}.pt"
+                torch.save(ckpt, ckpt_path)
+                log.write(f"wrote {ckpt_path}\n")
                 log.flush()
         ckpt = {
             "model": model.state_dict(),
@@ -734,6 +831,7 @@ def train(args: argparse.Namespace) -> None:
             "blocks": args.blocks,
             "max_delta": args.max_delta,
             "max_luma_delta": args.max_luma_delta,
+            "step": args.iters,
         }
         ckpt_path = out_dir / "refiner_pilot_final.pt"
         torch.save(ckpt, ckpt_path)
@@ -801,6 +899,33 @@ def luma_delta_loss(luma_delta: torch.Tensor | None, dot_gate: torch.Tensor, pro
     return (torch.abs(luma_delta) * (outside_dot + protect * 2.0)).mean()
 
 
+def signed_luma_detail_loss(
+    luma_delta: torch.Tensor | None,
+    pred: torch.Tensor,
+    current: torch.Tensor,
+    teacher: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    wp = torch.tensor([0.299, 0.587, 0.114], device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    target = ((teacher - current) * wp).sum(1, keepdim=True)
+    if luma_delta is None:
+        luma_delta = ((pred - current) * wp).sum(1, keepdim=True)
+    return (torch.abs(luma_delta - target) * weight).mean()
+
+
+def luma_gradient_loss(pred: torch.Tensor, teacher: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    wp = torch.tensor([0.299, 0.587, 0.114], device=pred.device, dtype=pred.dtype).view(1, 3, 1, 1)
+    yp = (pred * wp).sum(1, keepdim=True)
+    yt = (teacher * wp).sum(1, keepdim=True)
+    kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=pred.device, dtype=pred.dtype).view(1, 1, 3, 3) / 8.0
+    ky = kx.transpose(2, 3)
+    gpx = F.conv2d(yp, kx, padding=1)
+    gpy = F.conv2d(yp, ky, padding=1)
+    gtx = F.conv2d(yt, kx, padding=1)
+    gty = F.conv2d(yt, ky, padding=1)
+    return ((torch.abs(gpx - gtx) + torch.abs(gpy - gty)) * weight).mean()
+
+
 def gate_loss(
     gate: torch.Tensor | None,
     weak: torch.Tensor,
@@ -815,6 +940,12 @@ def gate_loss(
     supervised = F.smooth_l1_loss(gate, target, reduction="mean") * float(weight)
     sparsity = (gate * (0.25 + protect * 1.50)).mean() * float(sparsity_weight)
     return supervised + sparsity
+
+
+def direct_gate_loss(gate: torch.Tensor | None, target: torch.Tensor) -> torch.Tensor:
+    if gate is None:
+        return torch.zeros((), device=target.device, dtype=target.dtype)
+    return F.smooth_l1_loss(gate, torch.clamp(target, 0.0, 1.0), reduction="mean")
 
 
 def total_variation(x: torch.Tensor) -> torch.Tensor:
@@ -970,6 +1101,8 @@ def apply_full(args: argparse.Namespace) -> None:
         meta["model_kind"] = "gated"
     elif isinstance(model, ChromaLumaDotRefiner):
         meta["model_kind"] = "chroma_luma_dot"
+    elif isinstance(model, LumaDetailGateRefiner):
+        meta["model_kind"] = "luma_detail_gate"
     elif isinstance(model, ChromaPilotRefiner):
         meta["model_kind"] = "chroma"
     else:
@@ -1030,8 +1163,8 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=600)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=160)
-    p.add_argument("--model-kind", choices=["residual", "gated", "chroma", "chroma_luma_dot"], default="residual")
-    p.add_argument("--feature-set", choices=["basic", "texture", "texture_gates", "texture_signed_gates"], default="basic")
+    p.add_argument("--model-kind", choices=["residual", "gated", "chroma", "chroma_luma_dot", "luma_detail_gate"], default="residual")
+    p.add_argument("--feature-set", choices=["basic", "texture", "texture_gates", "texture_signed_gates", "texture_line_gates"], default="basic")
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--max-delta", type=float, default=0.050)
@@ -1059,11 +1192,16 @@ def main() -> None:
     p.add_argument("--luma-change-weight", type=float, default=0.0)
     p.add_argument("--luma-protect-weight", type=float, default=3.0)
     p.add_argument("--luma-dot-weight", type=float, default=0.0)
+    p.add_argument("--luma-detail-weight", type=float, default=0.0)
+    p.add_argument("--luma-gradient-weight", type=float, default=0.0)
+    p.add_argument("--line-restore-weight", type=float, default=0.0)
     p.add_argument("--luma-dot-sparsity-weight", type=float, default=0.0)
     p.add_argument("--gate-weight", type=float, default=0.0)
     p.add_argument("--gate-sparsity-weight", type=float, default=0.0)
+    p.add_argument("--detail-gate-weight", type=float, default=0.0)
     p.add_argument("--tv-weight", type=float, default=0.035)
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--seed", type=int, default=11)
     p.set_defaults(func=train)
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter, gaussian_gradient_magnitude, median_filter
+from scipy.ndimage import gaussian_filter, gaussian_gradient_magnitude, median_filter, uniform_filter
 
 from apply_flat_chroma_smoother import LUMA_LINEAR, LUMA_SRGB, linear_to_srgb_np, luma, smoothstep, srgb_to_linear_np
 from apply_luma_hf_shrink_filter import sigmoid01
@@ -23,6 +23,7 @@ from perfect_nr_probe import image_stats, make_preview, read_image
 
 AXES = {
     "magenta": np.array([0.5, -1.0, 0.5], dtype=np.float32),
+    "red": np.array([1.0, -0.5, -0.5], dtype=np.float32),
     "blue": np.array([-0.5, -0.5, 1.0], dtype=np.float32),
 }
 
@@ -84,6 +85,42 @@ def robust_axis_target(axis_value: np.ndarray, *, median_size: int, low_sigma: f
     return 0.65 * med + 0.35 * low
 
 
+def coherent_structure_gate(
+    guide_linear: np.ndarray,
+    *,
+    coherence_threshold: float,
+    coherence_transition: float,
+    energy_threshold: float,
+    energy_transition: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    guide = _safe_rgb(guide_linear)
+    display = np.clip(linear_to_srgb_np(guide), 0.0, 1.0)
+    y = luma(display, LUMA_SRGB)
+    structure = gaussian_filter(y, sigma=0.8, mode="reflect")
+    gy, gx = np.gradient(structure)
+    jxx = gaussian_filter(gx * gx, sigma=2.0, mode="reflect")
+    jyy = gaussian_filter(gy * gy, sigma=2.0, mode="reflect")
+    jxy = gaussian_filter(gx * gy, sigma=2.0, mode="reflect")
+    energy = jxx + jyy
+    coherence = np.sqrt((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy) / np.maximum(energy, 1.0e-8)
+    coherence_part = sigmoid01(
+        (coherence - float(coherence_threshold)) / max(float(coherence_transition), 1.0e-6)
+    )
+    energy_part = sigmoid01((energy - float(energy_threshold)) / max(float(energy_transition), 1.0e-6))
+    gate = gaussian_filter(
+        np.clip(coherence_part * energy_part, 0.0, 1.0).astype(np.float32, copy=False),
+        sigma=0.8,
+        mode="reflect",
+    )
+    stats = {
+        "coherent_gate_mean": float(np.mean(gate)),
+        "coherent_gate_p90": float(np.quantile(gate, 0.90)),
+        "coherent_gate_p99": float(np.quantile(gate, 0.99)),
+        "coherent_energy_p99": float(np.quantile(energy, 0.99)),
+    }
+    return gate.astype(np.float32, copy=False), stats
+
+
 def apply_signed_chroma_outlier_filter(
     image: np.ndarray,
     guide_image: np.ndarray,
@@ -94,6 +131,7 @@ def apply_signed_chroma_outlier_filter(
     outlier_threshold: float,
     outlier_transition: float,
     magenta_weight: float,
+    red_weight: float,
     blue_weight: float,
     structure_sigma: float,
     detail_sigma: float,
@@ -109,6 +147,12 @@ def apply_signed_chroma_outlier_filter(
     hdr_restore_peak_threshold: float,
     hdr_restore_threshold: float,
     hdr_restore_transition: float,
+    coherent_inhibit_strength: float = 0.0,
+    coherent_inhibit_coherence_threshold: float = 0.42,
+    coherent_inhibit_energy_threshold: float = 0.0045,
+    outlier_density_inhibit_strength: float = 0.0,
+    outlier_density_threshold: float = 0.42,
+    outlier_density_transition: float = 0.12,
 ) -> tuple[np.ndarray, dict[str, float], np.ndarray]:
     base = _safe_rgb(image)
     display = np.clip(linear_to_srgb_np(base), 0.0, 1.0)
@@ -129,6 +173,29 @@ def apply_signed_chroma_outlier_filter(
         highlight_threshold=highlight_threshold,
         highlight_transition=highlight_transition,
     )
+    coherent_stats: dict[str, float] = {
+        "coherent_inhibit_strength": float(coherent_inhibit_strength),
+        "coherent_inhibit_coherence_threshold": float(coherent_inhibit_coherence_threshold),
+        "coherent_inhibit_energy_threshold": float(coherent_inhibit_energy_threshold),
+        "coherent_inhibit_mean": 0.0,
+        "coherent_inhibit_p99": 0.0,
+        "outlier_density_inhibit_strength": float(outlier_density_inhibit_strength),
+        "outlier_density_threshold": float(outlier_density_threshold),
+        "outlier_density_transition": float(outlier_density_transition),
+    }
+    if float(coherent_inhibit_strength) > 0.0:
+        coherent, coherent_gate_stats = coherent_structure_gate(
+            guide_image,
+            coherence_threshold=coherent_inhibit_coherence_threshold,
+            coherence_transition=0.16,
+            energy_threshold=coherent_inhibit_energy_threshold,
+            energy_transition=max(float(coherent_inhibit_energy_threshold) * 0.85, 0.0025),
+        )
+        inhibit = np.clip(coherent * float(coherent_inhibit_strength), 0.0, 0.95).astype(np.float32, copy=False)
+        gate = gate * (1.0 - inhibit)
+        coherent_stats.update(coherent_gate_stats)
+        coherent_stats["coherent_inhibit_mean"] = float(np.mean(inhibit))
+        coherent_stats["coherent_inhibit_p99"] = float(np.quantile(inhibit, 0.99))
 
     out_chroma = chroma.copy()
     blend_max = np.zeros_like(y, dtype=np.float32)
@@ -139,11 +206,14 @@ def apply_signed_chroma_outlier_filter(
         "outlier_threshold": float(outlier_threshold),
         "outlier_transition": float(outlier_transition),
         "magenta_weight": float(magenta_weight),
+        "red_weight": float(red_weight),
         "blue_weight": float(blue_weight),
         **gate_stats,
+        **coherent_stats,
     }
     for name, raw_axis, weight in (
         ("magenta", AXES["magenta"], magenta_weight),
+        ("red", AXES["red"], red_weight),
         ("blue", AXES["blue"], blue_weight),
     ):
         if float(weight) <= 0.0:
@@ -153,6 +223,15 @@ def apply_signed_chroma_outlier_filter(
         target = robust_axis_target(axis_value, median_size=median_size, low_sigma=low_sigma)
         outlier = axis_value - target
         outlier_gate = sigmoid01((np.abs(outlier) - float(outlier_threshold)) / max(float(outlier_transition), 1.0e-6))
+        if float(outlier_density_inhibit_strength) > 0.0:
+            density = uniform_filter(outlier_gate.astype(np.float32, copy=False), size=5, mode="reflect")
+            density_inhibit = sigmoid01(
+                (density - float(outlier_density_threshold)) / max(float(outlier_density_transition), 1.0e-6)
+            )
+            outlier_gate = outlier_gate * (1.0 - np.clip(density_inhibit * float(outlier_density_inhibit_strength), 0.0, 0.95))
+            stats[f"{name}_density_mean"] = float(np.mean(density))
+            stats[f"{name}_density_p99"] = float(np.quantile(density, 0.99))
+            stats[f"{name}_density_inhibit_mean"] = float(np.mean(density_inhibit))
         blend = np.clip(gate * outlier_gate * float(strength) * float(weight), 0.0, 1.0).astype(np.float32, copy=False)
         out_chroma -= (outlier * blend)[..., None] * axis.reshape(1, 1, 3)
         blend_max = np.maximum(blend_max, blend)
@@ -191,6 +270,7 @@ def main() -> None:
     parser.add_argument("--outlier-threshold", type=float, default=0.0065)
     parser.add_argument("--outlier-transition", type=float, default=0.0040)
     parser.add_argument("--magenta-weight", type=float, default=1.0)
+    parser.add_argument("--red-weight", type=float, default=0.0)
     parser.add_argument("--blue-weight", type=float, default=0.75)
     parser.add_argument("--structure-sigma", type=float, default=1.2)
     parser.add_argument("--detail-sigma", type=float, default=2.8)
@@ -206,6 +286,13 @@ def main() -> None:
     parser.add_argument("--hdr-restore-peak-threshold", type=float, default=0.95)
     parser.add_argument("--hdr-restore-threshold", type=float, default=0.85)
     parser.add_argument("--hdr-restore-transition", type=float, default=0.25)
+    parser.add_argument("--coherent-inhibit-strength", type=float, default=0.0)
+    parser.add_argument("--coherent-inhibit-coherence-threshold", type=float, default=0.42)
+    parser.add_argument("--coherent-inhibit-energy-threshold", type=float, default=0.0045)
+    parser.add_argument("--outlier-density-inhibit-strength", type=float, default=0.0)
+    parser.add_argument("--outlier-density-threshold", type=float, default=0.42)
+    parser.add_argument("--outlier-density-transition", type=float, default=0.12)
+    parser.add_argument("--no-tiff", action="store_true")
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser()
@@ -225,6 +312,7 @@ def main() -> None:
         outlier_threshold=args.outlier_threshold,
         outlier_transition=args.outlier_transition,
         magenta_weight=args.magenta_weight,
+        red_weight=args.red_weight,
         blue_weight=args.blue_weight,
         structure_sigma=args.structure_sigma,
         detail_sigma=args.detail_sigma,
@@ -240,6 +328,12 @@ def main() -> None:
         hdr_restore_peak_threshold=args.hdr_restore_peak_threshold,
         hdr_restore_threshold=args.hdr_restore_threshold,
         hdr_restore_transition=args.hdr_restore_transition,
+        coherent_inhibit_strength=args.coherent_inhibit_strength,
+        coherent_inhibit_coherence_threshold=args.coherent_inhibit_coherence_threshold,
+        coherent_inhibit_energy_threshold=args.coherent_inhibit_energy_threshold,
+        outlier_density_inhibit_strength=args.outlier_density_inhibit_strength,
+        outlier_density_threshold=args.outlier_density_threshold,
+        outlier_density_transition=args.outlier_density_transition,
     )
 
     exr_path = out_dir / f"{name}.exr"
@@ -248,19 +342,22 @@ def main() -> None:
     blend_path = out_dir / f"{name}_blend.png"
     meta_path = out_dir / f"{name}_meta.json"
     write_exr(exr_path, out)
-    write_tiff(tiff_path, out)
+    if not args.no_tiff:
+        write_tiff(tiff_path, out)
     Image.fromarray(make_preview(out)).save(preview_path)
     Image.fromarray((np.clip(blend, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)).save(blend_path)
     stats["input"] = str(input_path)
     stats["guide"] = str(guide_path)
     stats["output"] = str(exr_path)
+    stats["tiff"] = None if args.no_tiff else str(tiff_path)
     stats["preview"] = str(preview_path)
     stats["blend"] = str(blend_path)
     stats["output_stats"] = image_stats(out)
     meta_path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(stats, indent=2))
     print(f"wrote {exr_path}")
-    print(f"wrote {tiff_path}")
+    if not args.no_tiff:
+        print(f"wrote {tiff_path}")
     print(f"wrote {preview_path}")
     print(f"wrote {blend_path}")
 
