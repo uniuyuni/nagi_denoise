@@ -13,9 +13,6 @@ __pycache__/
 .venv/
 venv/
 
-# Separately managed local clones
-packages/nafnet_applesilicon/
-
 # Experiment outputs and checkpoints
 runs/
 *.pt

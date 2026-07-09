@@ -12,7 +12,7 @@ import sys
 
 import torch
 
-from nagi_nr.devices import describe_devices, resolve_device
+from nagi_denoise.devices import describe_devices, resolve_device
 
 
 def main() -> None:
@@ -32,11 +32,9 @@ def main() -> None:
     print(f"cuda available: {devices['cuda_available']}")
     print(f"auto device: {resolve_device('auto')}")
 
-    import nagi_nr
-    import nagi_nr_bench
+    import nagi_denoise
 
-    print(f"nagi_nr: {nagi_nr.__file__}")
-    print(f"nagi_nr_bench: {nagi_nr_bench.__file__}")
+    print(f"nagi_denoise: {nagi_denoise.__file__}")
 
     if devices["mps_available"]:
         x = torch.ones(4, device="mps")

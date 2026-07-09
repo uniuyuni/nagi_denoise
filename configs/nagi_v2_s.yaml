@@ -1,0 +1,89 @@
+# NagiV2-S masked chroma smoothing gate.
+#
+# Purpose:
+#   Do not let a free RGB residual invent color. Continue from flatpush_final,
+#   freeze the main denoiser, and train only a tiny one-channel gate that blends
+#   flat-region display chroma toward its local lowpass. This gives the model a
+#   deterministic, bounded chroma-denoise mechanism rather than asking the main
+#   backbone/loss to discover it indirectly.
+
+model:
+  kind: nagi_v2
+  preset: v2-s
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+  highlight_protect_threshold: 0.0
+  highlight_protect_transition: 0.15
+  highlight_protect_strength: 0.0
+  chroma_gate_threshold: 0.010
+  chroma_gate_transition: 0.006
+  chroma_gate_kernel_size: 9
+  chroma_gate_highlight_threshold: 1.0
+  chroma_gate_highlight_transition: 0.2
+  chroma_gate_strength: 1.0
+  chroma_smooth_branch: true
+  chroma_smooth_strength: 0.75
+  chroma_smooth_kernel_size: 9
+  chroma_smooth_gate_bias: -4.0
+  chroma_smooth_gate_scale: 1.0
+
+data:
+  patch_size: 128
+  patches_per_image: 12
+  chunk_size: 4
+  exposure_jitter: [0.75, 1.8]
+  flip_rot: true
+  randomize_each_access: true
+  synth_prob: 0.08
+  gauss_sigma_max: 18.0
+  poisson_lambda_range: [35.0, 180.0]
+  jpeg_q_range: [90, 100]
+  num_workers: 0
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+
+train:
+  batch_size: 1
+  grad_accum_steps: 3
+  total_iters: 3000
+  warmup_iters: 80
+  lr: 2.5e-3
+  lr_min: 8.0e-5
+  weight_decay: 0.0
+  grad_clip: 0.5
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 6
+  freeze_for_chroma_branch: false
+
+loss:
+  final_weight: 0.015
+  base_weight: 0.0
+  srgb_weight: 0.015
+  srgb_base_weight: 0.0
+  body_srgb_weight: 0.008
+  body_srgb_base_weight: 0.0
+  flat_srgb_hf_weight: 0.0
+  flat_luma_hf_weight: 0.001
+  flat_chroma_hf_weight: 0.0
+  flat_chroma_damp_weight: 0.0
+  flat_chroma_distill_weight: 6.0
+  flat_chroma_delta_distill_weight: 24.0
+  flat_chroma_distill_strength: 0.75
+  flat_chroma_distill_kernel_size: 9
+  flat_threshold: 0.010
+  flat_transition: 0.006
+  flat_kernel_size: 9
+  linear_weight: 0.0008
+  highlight_luma_weight: 0.10
+  highlight_chroma_weight: 0.08
+  highlight_ratio_weight: 0.04
+  detail_weight: 0.02
+  confidence_l1_weight: 0.0
+  highlight_threshold: 1.0
+  highlight_transition: 0.7
+  detail_kernel_size: 9
+  linear_clamp: 12.0
+  charbonnier_eps: 1.0e-3

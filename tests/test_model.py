@@ -1,4 +1,4 @@
-"""Smoke tests for Nagi NR model and transforms.
+"""Smoke tests for Nagi Denoise models and transforms.
 
 Run with: python -m pytest tests/  (or just python tests/test_model.py)
 """
@@ -9,20 +9,18 @@ from pathlib import Path
 import torch
 
 # Fallback path so `python3 tests/test_model.py` works without an editable install.
-# A real `pip install -e packages/nagi_nr` is preferred and makes this line a no-op.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "nagi_nr" / "src"))
+# A real `pixi install` / `pip install -e .` is preferred and makes this line a no-op.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from nagi_nr.model import NagiNR
-from nagi_nr.nagiq import NagiQ, build_nagiq_preset
-from nagi_nr.nagiperfect import NagiPerfect, build_nagiperfect_preset
-from nagi_nr.realfast import NagiRealFast, build_realfast_preset
-from nagi_nr.transforms import (
+from nagi_denoise.models.nagi_nr import NagiNR
+from nagi_denoise.models.nagi_v2 import NagiV2, build_nagi_v2_preset
+from nagi_denoise.transforms import (
     asinh_compress,
     asinh_decompress,
     linear_to_srgb,
     srgb_to_linear,
 )
-from nagi_nr.losses import NagiLoss, NagiPerfectLoss
+from nagi_denoise.losses import NagiLoss, NagiV2Loss
 
 
 def test_forward_shape_and_dtype():
@@ -87,44 +85,8 @@ def test_loss_runs_and_is_finite():
     assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in m.parameters())
 
 
-def test_nagiq_forward_shape_and_identity_init():
-    m = NagiQ(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1)).eval()
-    x = torch.rand(1, 3, 35, 41)
-    with torch.no_grad():
-        y = m(x)
-    assert y.shape == x.shape
-    assert y.dtype == torch.float32
-    assert torch.allclose(x, y, atol=1e-5), (x - y).abs().max()
-
-
-def test_nagiq_preset_builds():
-    m = build_nagiq_preset("q48-fast")
-    x = torch.rand(1, 3, 64, 64)
-    with torch.no_grad():
-        y = m(x)
-    assert y.shape == x.shape
-
-
-def test_realfast_forward_shape_and_identity_init():
-    m = NagiRealFast(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1)).eval()
-    x = torch.rand(1, 3, 35, 41)
-    with torch.no_grad():
-        y = m(x)
-    assert y.shape == x.shape
-    assert y.dtype == torch.float32
-    assert torch.allclose(x, y, atol=1e-5), (x - y).abs().max()
-
-
-def test_realfast_preset_builds():
-    m = build_realfast_preset("realfast-v0-lite")
-    x = torch.rand(1, 3, 64, 64)
-    with torch.no_grad():
-        y = m(x)
-    assert y.shape == x.shape
-
-
-def test_nagiperfect_forward_aux_and_identity_init():
-    m = NagiPerfect(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1)).eval()
+def test_nagi_v2_forward_aux_and_identity_init():
+    m = NagiV2(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1)).eval()
     x = torch.rand(1, 3, 35, 41) * 4.0
     with torch.no_grad():
         y = m(x)
@@ -138,9 +100,9 @@ def test_nagiperfect_forward_aux_and_identity_init():
     assert torch.allclose(x, y, atol=1e-4), (x - y).abs().max()
 
 
-def test_nagiperfect_loss_runs_and_has_gradients():
-    m = NagiPerfect(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1))
-    crit = NagiPerfectLoss(compress_fn=m.compress)
+def test_nagi_v2_loss_runs_and_has_gradients():
+    m = NagiV2(width=8, enc_blk_nums=(1, 1), middle_blk_num=1, dec_blk_nums=(1, 1))
+    crit = NagiV2Loss(compress_fn=m.compress)
     noisy = torch.rand(2, 3, 32, 32) * 3.0
     target = torch.rand(2, 3, 32, 32) * 3.0
     pred = m(noisy, return_aux=True)
@@ -150,16 +112,16 @@ def test_nagiperfect_loss_runs_and_has_gradients():
     assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in m.parameters())
 
 
-def test_nagiperfect_preset_builds():
-    m = build_nagiperfect_preset("perfect-s")
+def test_nagi_v2_preset_builds():
+    m = build_nagi_v2_preset("v2-s")
     x = torch.rand(1, 3, 64, 64)
     with torch.no_grad():
         y = m(x)
     assert y.shape == x.shape
 
 
-def test_nagiperfect_chroma_branch_identity_init():
-    m = NagiPerfect(
+def test_nagi_v2_chroma_branch_identity_init():
+    m = NagiV2(
         width=8,
         enc_blk_nums=(1, 1),
         middle_blk_num=1,
@@ -179,8 +141,8 @@ def test_nagiperfect_chroma_branch_identity_init():
     assert torch.allclose(aux["output"], x, atol=1e-4), (aux["output"] - x).abs().max()
 
 
-def test_nagiperfect_chroma_smooth_branch_identity_init():
-    m = NagiPerfect(
+def test_nagi_v2_chroma_smooth_branch_identity_init():
+    m = NagiV2(
         width=8,
         enc_blk_nums=(1, 1),
         middle_blk_num=1,
@@ -198,8 +160,8 @@ def test_nagiperfect_chroma_smooth_branch_identity_init():
     assert torch.allclose(aux["output"], x, atol=1e-4), (aux["output"] - x).abs().max()
 
 
-def test_nagiperfect_input_highlight_guard_locks_highlights():
-    m = NagiPerfect(
+def test_nagi_v2_input_highlight_guard_locks_highlights():
+    m = NagiV2(
         width=8,
         enc_blk_nums=(1, 1),
         middle_blk_num=1,
@@ -224,12 +186,10 @@ if __name__ == "__main__":
     test_srgb_linear_roundtrip()
     test_identity_at_init_is_near_input()
     test_loss_runs_and_is_finite()
-    test_nagiq_forward_shape_and_identity_init()
-    test_nagiq_preset_builds()
-    test_realfast_forward_shape_and_identity_init()
-    test_realfast_preset_builds()
-    test_nagiperfect_forward_aux_and_identity_init()
-    test_nagiperfect_loss_runs_and_has_gradients()
-    test_nagiperfect_preset_builds()
-    test_nagiperfect_input_highlight_guard_locks_highlights()
+    test_nagi_v2_forward_aux_and_identity_init()
+    test_nagi_v2_loss_runs_and_has_gradients()
+    test_nagi_v2_preset_builds()
+    test_nagi_v2_chroma_branch_identity_init()
+    test_nagi_v2_chroma_smooth_branch_identity_init()
+    test_nagi_v2_input_highlight_guard_locks_highlights()
     print("all tests passed")
