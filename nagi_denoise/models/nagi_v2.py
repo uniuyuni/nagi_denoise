@@ -579,6 +579,9 @@ class NagiV2(nn.Module):
 NAGI_V2_PRESETS = {
     "v2-s": dict(width=32, enc_blk_nums=(1, 2, 3), middle_blk_num=4, dec_blk_nums=(1, 1, 2)),
     "v2-m": dict(width=48, enc_blk_nums=(2, 2, 4), middle_blk_num=6, dec_blk_nums=(1, 2, 2)),
+    # v2-l continues the s->m progression by scaling trunk width 48 -> 64 while
+    # keeping the v2-m block layout: 15.430M params (target band 12-16M).
+    "v2-l": dict(width=64, enc_blk_nums=(2, 2, 4), middle_blk_num=6, dec_blk_nums=(1, 2, 2)),
 }
 
 # Older checkpoints (saved before the NagiPerfect -> NagiV2 rename) stamp

@@ -35,5 +35,7 @@ eval-sidd-scunet = "nagi-eval-sidd --model scunet --weights benchmarks/scunet/sc
 denoise = "nagi-denoise"
 denoise-exr = "python -m nagi_denoise.pipeline.denoise_exr"
 roi-eval = "python -m nagi_denoise.pipeline.roi_noise_eval"
+accept-eval = "python -m nagi_denoise.pipeline.acceptance"
+train-v2-l = "nagi-train-v2 --config configs/nagi_v2_l.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_l --device mps --ckpt-prefix nagi_v2_l --resume-latest"
 crop-compare = "python -m nagi_denoise.pipeline.make_crop_compare"
 precompute-teacher = "python -m nagi_denoise.pipeline.precompute_teacher --sidd-root SIDD_Medium_Srgb --weights benchmarks/nafnet/NAFNet-SIDD-width64.pth --device mps"

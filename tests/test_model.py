@@ -120,6 +120,39 @@ def test_nagi_v2_preset_builds():
     assert y.shape == x.shape
 
 
+def test_nagi_v2_l_preset_builds_identity_and_shape():
+    m = build_nagi_v2_preset("v2-l").eval()
+    n_params = m.param_count()
+    assert 12.0e6 <= n_params <= 16.0e6, f"v2-l params out of range: {n_params/1e6:.2f}M"
+    x = torch.rand(1, 3, 35, 41) * 4.0  # non-multiple size + HDR range
+    with torch.no_grad():
+        y = m(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    # Heads are zero-initialized: the model must start as an identity.
+    assert torch.allclose(x, y, atol=1e-4), (x - y).abs().max()
+
+
+def test_synthetic_poisson_gaussian_linear():
+    import numpy as np
+    from nagi_denoise.data import apply_poisson_gaussian_linear, sample_poisson_gaussian_params
+
+    rng = np.random.default_rng(0)
+    a, b = sample_poisson_gaussian_params(rng, (3.0e-4, 2.0e-2), (1.0e-6, 1.0e-3))
+    assert 3.0e-4 <= a <= 2.0e-2 and 1.0e-6 <= b <= 1.0e-3
+    clean = torch.rand(3, 64, 64) * 2.0  # includes HDR range
+    noisy = apply_poisson_gaussian_linear(rng, clean, a=2.0e-2, b=1.0e-3, chroma_scale=0.35)
+    assert noisy.shape == clean.shape
+    assert torch.isfinite(noisy).all()
+    assert (noisy >= 0.0).all()
+    assert not torch.allclose(noisy, clean)  # noise actually applied
+    # Heteroscedastic: bright regions must carry more noise than dark ones.
+    resid = (noisy - clean).abs()
+    bright = resid[clean > 1.0].mean()
+    dark = resid[clean < 0.2].mean()
+    assert bright > dark
+
+
 def test_nagi_v2_chroma_branch_identity_init():
     m = NagiV2(
         width=8,
@@ -189,6 +222,8 @@ if __name__ == "__main__":
     test_nagi_v2_forward_aux_and_identity_init()
     test_nagi_v2_loss_runs_and_has_gradients()
     test_nagi_v2_preset_builds()
+    test_nagi_v2_l_preset_builds_identity_and_shape()
+    test_synthetic_poisson_gaussian_linear()
     test_nagi_v2_chroma_branch_identity_init()
     test_nagi_v2_chroma_smooth_branch_identity_init()
     test_nagi_v2_input_highlight_guard_locks_highlights()

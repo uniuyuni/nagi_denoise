@@ -1,0 +1,70 @@
+# NagiV2-L smoke test: 500 iterations, same architecture/loss/mixture as
+# configs/nagi_v2_l.yaml, sized so it also completes on CPU when MPS is busy
+# (batch 1 x grad_accum 2, the proven NagiPerfect pilot arrangement).
+#
+# Pass/fail gates: no non-finite abort, loss decreases, all three mixture
+# sources sampled (see src_* counters in the log).
+#
+# Run (CPU example):
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l_smoke.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l_smoke --device cpu --ckpt-prefix nagi_v2_l_smoke
+
+model:
+  kind: nagi_v2
+  preset: v2-l
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0
+  confidence_bias: -2.0
+
+data:
+  patch_size: 256
+  mixture:
+    sidd: 0.6
+    polyu: 0.2
+    synthetic: 0.2
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  burst_length: 8
+  num_workers: 1
+  # Same ISO-ladder Poisson-Gaussian ranges as the full recipe (see
+  # configs/nagi_v2_l.yaml for the derivation of these numbers).
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+  teacher_root: null
+
+train:
+  batch_size: 1
+  grad_accum_steps: 2
+  total_iters: 500
+  warmup_iters: 100
+  lr: 2.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 25
+  save_every: 250
+  keep_last_ckpts: 2
+  skip_nonfinite: false
+
+loss:
+  final_weight: 1.0
+  base_weight: 0.35
+  fft_weight: 0.05
+  linear_weight: 0.08
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14
+  confidence_l1_weight: 0.002
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  distill_weight: 0.05

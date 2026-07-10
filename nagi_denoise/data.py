@@ -17,19 +17,26 @@ I/O strategy: SIDD images are ~5328x3000 PNG (~25MB each). Decoding one PNG
 costs ~0.5-1s, so naive random patch sampling makes training I/O-bound.
 
 This module ships:
-  * `SIDDPatchDataset` — caches the last-decoded pair per instance.
+  * `SIDDPatchDataset` — caches the last-decoded pair per instance. Random
+    crops are drawn per access (`randomize_each_access=True` in training), so
+    every iteration sees fresh crops — never a fixed crop list (NagiQ lesson).
   * `ChunkedShuffleSampler` — yields indices grouped by image so the cache hits.
-
-Use them together via `make_sidd_loader` (or directly in your own DataLoader).
+  * `PolyUPatchDataset` — same treatment for PolyU CroppedImages real pairs.
+  * `apply_poisson_gaussian_linear` — physically-based heteroscedastic
+    Poisson-Gaussian noise in linear light (ISO-ladder a/b, optional
+    chroma-correlated component).
+  * `MixturePatchDataset` — infinite IterableDataset mixing {SIDD real,
+    PolyU real, synthetic} pairs with configurable weights; also carries the
+    precomputed NAFNet teacher output for SIDD samples (distillation).
 """
 from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, IterableDataset, Sampler
 from PIL import Image
 
 from .transforms import srgb_to_linear
@@ -575,3 +582,352 @@ class ChunkedShuffleSampler(Sampler[int]):
             for offset in range(self.chunk_size):
                 yield base + offset
         self.epoch += 1
+
+
+class PolyUPatchDataset(SIDDPatchDataset):
+    """Random patch sampler over PolyU real-world noisy pairs.
+
+    Files under ``<root>/CroppedImages/`` pair ``*_real.JPG`` (noisy) with
+    ``*_mean.JPG`` (temporal-mean clean target). Crops/augment/sRGB->linear
+    treatment is identical to :class:`SIDDPatchDataset`; only pair discovery
+    differs. PolyU crops are 512x512, so keep ``patch_size <= 512``.
+    """
+
+    def __init__(self, root: str | Path, split: str = "CroppedImages", **kwargs):
+        pairs = find_polyu_pairs(root, split=split)
+        if not pairs:
+            raise FileNotFoundError(f"No PolyU real/mean pairs discovered under {root}")
+        kwargs.pop("pairs", None)
+        super().__init__(root=root, pairs=pairs, **kwargs)
+
+
+# ---- Physically-based synthetic noise (linear space) ----
+def sample_poisson_gaussian_params(
+    rng: np.random.Generator,
+    a_range: Tuple[float, float],
+    b_range: Tuple[float, float],
+) -> Tuple[float, float]:
+    """Sample per-image (a, b) log-uniformly from an ISO-ladder range.
+
+    The heteroscedastic model is ``noisy = clean + sqrt(a*clean + b) * N(0,1)``
+    with ``clean`` in linear light normalized so 1.0 = SDR white. ``a`` is the
+    shot-noise (Poisson) slope, ``b`` the signal-independent (read) variance.
+    """
+    a = float(np.exp(rng.uniform(np.log(a_range[0]), np.log(a_range[1]))))
+    b = float(np.exp(rng.uniform(np.log(b_range[0]), np.log(b_range[1]))))
+    return a, b
+
+
+def apply_poisson_gaussian_linear(
+    rng: np.random.Generator,
+    clean_linear: torch.Tensor,
+    a: float,
+    b: float,
+    chroma_scale: float = 0.0,
+) -> torch.Tensor:
+    """Add heteroscedastic Poisson-Gaussian noise to a linear-light CHW tensor.
+
+    ``noisy = clean + sqrt(a*clean + b) * N(0,1)``, all float32 linear.
+    Optionally adds a mild chroma-correlated component: a shared 2x-upsampled
+    (spatially correlated) single-channel noise field pushed along a random
+    zero-luma chroma axis, with amplitude ``chroma_scale`` relative to the
+    local Poisson-Gaussian sigma. Output is clamped to >= 0 like the real
+    sRGB-decoded pairs.
+    """
+    clean = clean_linear.clamp_min(0.0)
+    sigma = torch.sqrt(a * clean + b)
+    noise = torch.from_numpy(rng.standard_normal(tuple(clean.shape)).astype(np.float32))
+    noisy = clean + sigma * noise
+
+    if chroma_scale > 0.0:
+        _, h, w = clean.shape
+        h2, w2 = max(1, h // 2), max(1, w // 2)
+        field = torch.from_numpy(rng.standard_normal((1, 1, h2, w2)).astype(np.float32))
+        field = torch.nn.functional.interpolate(field, size=(h, w), mode="bilinear", align_corners=False)[0]
+        axis = rng.standard_normal(3).astype(np.float32)
+        axis = axis - float((axis * LUMA_LINEAR).sum())  # remove luma component
+        norm = float(np.sqrt((axis * axis).sum()))
+        if norm > 1.0e-6:
+            axis_t = torch.from_numpy(axis / norm).view(3, 1, 1)
+            noisy = noisy + sigma * float(chroma_scale) * field * axis_t
+
+    return noisy.clamp_min(0.0)
+
+
+def teacher_path_for_noisy(noisy_path: str | Path, teacher_root: Optional[str | Path] = None) -> Path:
+    """Resolve the precomputed NAFNet teacher PNG for a SIDD noisy image.
+
+    Default location (written by ``nagi_denoise.pipeline.precompute_teacher``)
+    is next to the noisy file with NOISY replaced by TEACHER. With
+    ``teacher_root``, the same ``<scene>/<name>`` layout is expected under
+    that root instead.
+    """
+    p = Path(noisy_path)
+    if "NOISY" not in p.name:
+        return p.with_name("__missing_teacher__")
+    name = p.name.replace("NOISY", "TEACHER")
+    if teacher_root:
+        return Path(teacher_root) / p.parent.name / name
+    return p.with_name(name)
+
+
+class _BurstPairSource:
+    """Uniform random (image, position) sampling with burst-amortized decode.
+
+    Every call yields a fresh random crop, but the (expensive to decode) source
+    image is re-drawn only every ``burst_length`` calls. Over training this is
+    uniform over images and spatial positions while keeping I/O tractable for
+    5328x3000 SIDD PNGs. This replaces any notion of a fixed crop list — the
+    NagiQ failure mode (training on 1280 frozen crops) is structurally
+    impossible here.
+    """
+
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[str, str]],
+        burst_length: int = 8,
+        teacher_root: Optional[str | Path] = None,
+        with_teacher: bool = False,
+    ):
+        self.pairs = list(pairs)
+        if not self.pairs:
+            raise ValueError("empty pair list for mixture source")
+        self.burst_length = max(1, int(burst_length))
+        self.teacher_root = teacher_root
+        self.with_teacher = bool(with_teacher)
+        self._burst_left = 0
+        self._noisy: Optional[np.ndarray] = None
+        self._clean: Optional[np.ndarray] = None
+        self._teacher: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _load(path: str | Path) -> np.ndarray:
+        with Image.open(path) as im:
+            return np.array(im.convert("RGB"), dtype=np.uint8)
+
+    def _decode(self, rng: np.random.Generator) -> None:
+        idx = int(rng.integers(0, len(self.pairs)))
+        noisy_path, clean_path = self.pairs[idx]
+        self._noisy = self._load(noisy_path)
+        self._clean = self._load(clean_path)
+        self._teacher = None
+        if self.with_teacher:
+            tpath = teacher_path_for_noisy(noisy_path, self.teacher_root)
+            if tpath.exists():
+                try:
+                    self._teacher = self._load(tpath)
+                except Exception:
+                    self._teacher = None  # partially-written file; fall back to GT
+        self._burst_left = self.burst_length
+
+    def sample(
+        self, rng: np.random.Generator, patch_size: int
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        if self._burst_left <= 0 or self._noisy is None:
+            self._decode(rng)
+        self._burst_left -= 1
+        H, W, _ = self._noisy.shape
+        if H < patch_size or W < patch_size:
+            raise RuntimeError(f"Image too small ({H}x{W}) for patch {patch_size}")
+        y = int(rng.integers(0, H - patch_size + 1))
+        x = int(rng.integers(0, W - patch_size + 1))
+        sl = (slice(y, y + patch_size), slice(x, x + patch_size))
+        noisy = self._noisy[sl]
+        clean = self._clean[sl]
+        teacher = self._teacher[sl] if self._teacher is not None else None
+        return noisy, clean, teacher
+
+
+class _BurstCleanSource:
+    """Burst-amortized random crops from clean images (for synthetic noise)."""
+
+    def __init__(self, paths: Sequence[str], burst_length: int = 8):
+        self.paths = list(paths)
+        if not self.paths:
+            raise ValueError("empty clean list for synthetic source")
+        self.burst_length = max(1, int(burst_length))
+        self._burst_left = 0
+        self._clean: Optional[np.ndarray] = None
+
+    def _decode(self, rng: np.random.Generator) -> None:
+        idx = int(rng.integers(0, len(self.paths)))
+        self._clean = _BurstPairSource._load(self.paths[idx])
+        self._burst_left = self.burst_length
+
+    def sample(self, rng: np.random.Generator, patch_size: int) -> np.ndarray:
+        if self._burst_left <= 0 or self._clean is None:
+            self._decode(rng)
+        self._burst_left -= 1
+        H, W, _ = self._clean.shape
+        if H < patch_size or W < patch_size:
+            raise RuntimeError(f"Image too small ({H}x{W}) for patch {patch_size}")
+        y = int(rng.integers(0, H - patch_size + 1))
+        x = int(rng.integers(0, W - patch_size + 1))
+        return self._clean[y : y + patch_size, x : x + patch_size]
+
+
+MIXTURE_SOURCE_IDS: Dict[str, int] = {"sidd": 0, "polyu": 1, "synthetic": 2}
+MIXTURE_SOURCE_NAMES: Dict[int, str] = {v: k for k, v in MIXTURE_SOURCE_IDS.items()}
+
+
+class MixturePatchDataset(IterableDataset):
+    """Infinite stream mixing SIDD real, PolyU real, and synthetic-noise pairs.
+
+    Each yielded sample is drawn independently: first the source is chosen by
+    the configured weights, then a fresh random crop is taken (see
+    ``_BurstPairSource`` for the uniformity/IO tradeoff). There is no fixed
+    crop list and no epoch: every iteration sees new random crops.
+
+    Per sample:
+      * SIDD / PolyU: real (noisy, clean) crop, sRGB->linear, shared
+        log-uniform exposure jitter (preserves the real noise/signal ratio).
+      * synthetic: a clean crop (SIDD GT or PolyU mean), sRGB->linear,
+        exposure jitter FIRST, then heteroscedastic Poisson-Gaussian noise
+        ``noisy = clean + sqrt(a*clean + b) * N(0,1)`` with per-image (a, b)
+        log-uniform from the configured ISO-ladder ranges.
+
+    Yields ``(noisy, clean, teacher, has_teacher, source_id)`` where teacher is
+    the precomputed NAFNet output (SIDD only, when available; otherwise the
+    clean target as a placeholder with ``has_teacher = 0``).
+    """
+
+    def __init__(
+        self,
+        sidd_pairs: Sequence[Tuple[str, str]],
+        polyu_pairs: Sequence[Tuple[str, str]],
+        weights: Dict[str, float],
+        patch_size: int = 256,
+        exposure_jitter: Optional[Tuple[float, float]] = (0.25, 4.0),
+        flip_rot: bool = True,
+        seed: int = 0,
+        burst_length: int = 8,
+        teacher_root: Optional[str | Path] = None,
+        with_teacher: bool = True,
+        synth_a_range: Tuple[float, float] = (3.0e-4, 2.0e-2),
+        synth_b_range: Tuple[float, float] = (1.0e-6, 1.0e-3),
+        synth_chroma_prob: float = 0.5,
+        synth_chroma_scale: float = 0.35,
+    ):
+        super().__init__()
+        if patch_size % 8 != 0:
+            raise ValueError("patch_size must be a multiple of 8")
+        self.patch_size = int(patch_size)
+        self.exposure_jitter = exposure_jitter
+        self.flip_rot = bool(flip_rot)
+        self.seed = int(seed)
+        self.burst_length = int(burst_length)
+        self.teacher_root = teacher_root
+        self.with_teacher = bool(with_teacher)
+        self.synth_a_range = (float(synth_a_range[0]), float(synth_a_range[1]))
+        self.synth_b_range = (float(synth_b_range[0]), float(synth_b_range[1]))
+        self.synth_chroma_prob = float(synth_chroma_prob)
+        self.synth_chroma_scale = float(synth_chroma_scale)
+
+        weights = {k: float(v) for k, v in dict(weights).items() if float(v) > 0.0}
+        unknown = set(weights) - set(MIXTURE_SOURCE_IDS)
+        if unknown:
+            raise ValueError(f"unknown mixture sources: {sorted(unknown)}")
+        if not weights:
+            raise ValueError("mixture weights are all zero")
+        if "sidd" in weights and not sidd_pairs:
+            raise ValueError("mixture requests sidd but no SIDD pairs found")
+        if "polyu" in weights and not polyu_pairs:
+            raise ValueError("mixture requests polyu but no PolyU pairs found")
+        total = sum(weights.values())
+        self.weights = {k: v / total for k, v in weights.items()}
+
+        self._sidd_pairs = list(sidd_pairs)
+        self._polyu_pairs = list(polyu_pairs)
+        clean_paths = [gt for _, gt in self._sidd_pairs] + [mean for _, mean in self._polyu_pairs]
+        if "synthetic" in self.weights and not clean_paths:
+            raise ValueError("mixture requests synthetic but no clean images found")
+        self._clean_paths = clean_paths
+
+        # Count available precomputed teacher files (informational; the trainer
+        # warns and zeroes the distill term when this is 0).
+        self.num_teacher_files = 0
+        if self.with_teacher:
+            self.num_teacher_files = sum(
+                1 for noisy, _ in self._sidd_pairs if teacher_path_for_noisy(noisy, teacher_root).exists()
+            )
+
+    # ---- Sample pipeline ----
+    def _to_linear(self, arr_u8: np.ndarray) -> torch.Tensor:
+        t = torch.from_numpy(np.ascontiguousarray(arr_u8)).permute(2, 0, 1).float().div_(255.0)
+        return srgb_to_linear(t)
+
+    def _augment(self, rng: np.random.Generator, views: List[torch.Tensor]) -> List[torch.Tensor]:
+        if not self.flip_rot:
+            return [v.contiguous() for v in views]
+        fx = rng.random() < 0.5
+        fy = rng.random() < 0.5
+        k = int(rng.integers(0, 4))
+        out = []
+        for v in views:
+            if fx:
+                v = v.flip(-1)
+            if fy:
+                v = v.flip(-2)
+            if k:
+                v = torch.rot90(v, k, dims=(-2, -1))
+            out.append(v.contiguous())
+        return out
+
+    def _exposure_scale(self, rng: np.random.Generator) -> float:
+        if self.exposure_jitter is None:
+            return 1.0
+        lo, hi = self.exposure_jitter
+        return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+    def _sample(self, rng: np.random.Generator, sources: Dict[str, object]):
+        names = list(self.weights.keys())
+        probs = np.array([self.weights[n] for n in names], dtype=np.float64)
+        source_name = names[int(rng.choice(len(names), p=probs))]
+        source_id = MIXTURE_SOURCE_IDS[source_name]
+        ps = self.patch_size
+        scale = self._exposure_scale(rng)
+
+        if source_name == "synthetic":
+            clean_u8 = sources["synthetic"].sample(rng, ps)
+            clean = self._to_linear(clean_u8) * scale  # exposure jitter FIRST
+            a, b = sample_poisson_gaussian_params(rng, self.synth_a_range, self.synth_b_range)
+            chroma_scale = self.synth_chroma_scale if rng.random() < self.synth_chroma_prob else 0.0
+            noisy = apply_poisson_gaussian_linear(rng, clean, a, b, chroma_scale=chroma_scale)
+            teacher = clean
+            has_teacher = 0.0
+            views = self._augment(rng, [noisy, clean])
+            noisy, clean = views
+            teacher = clean
+        else:
+            noisy_u8, clean_u8, teacher_u8 = sources[source_name].sample(rng, ps)
+            noisy = self._to_linear(noisy_u8) * scale
+            clean = self._to_linear(clean_u8) * scale
+            if teacher_u8 is not None:
+                teacher = self._to_linear(teacher_u8) * scale
+                has_teacher = 1.0
+                noisy, clean, teacher = self._augment(rng, [noisy, clean, teacher])
+            else:
+                has_teacher = 0.0
+                noisy, clean = self._augment(rng, [noisy, clean])
+                teacher = clean
+
+        return noisy, clean, teacher, np.float32(has_teacher), np.int64(source_id)
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        worker_id = int(info.id) if info is not None else 0
+        rng = np.random.default_rng((self.seed * 1000003 + worker_id * 7919 + 17) & 0xFFFFFFFF)
+        sources: Dict[str, object] = {}
+        if "sidd" in self.weights:
+            sources["sidd"] = _BurstPairSource(
+                self._sidd_pairs,
+                burst_length=self.burst_length,
+                teacher_root=self.teacher_root,
+                with_teacher=self.with_teacher,
+            )
+        if "polyu" in self.weights:
+            sources["polyu"] = _BurstPairSource(self._polyu_pairs, burst_length=self.burst_length)
+        if "synthetic" in self.weights:
+            sources["synthetic"] = _BurstCleanSource(self._clean_paths, burst_length=self.burst_length)
+        while True:
+            yield self._sample(rng, sources)

@@ -67,9 +67,19 @@ def tiled_forward(model, img_t: torch.Tensor, tile: int, overlap: int) -> torch.
     return out / weight.clamp_min(1e-8)
 
 
-def teacher_path_for(noisy_path: str) -> Path:
+def teacher_path_for(noisy_path: str, out_root: str | None = None) -> Path:
+    """Output path for a teacher PNG.
+
+    Default: next to the noisy file, NOISY -> TEACHER (what the training-time
+    loader expects). With ``out_root``, mirrors the ``<scene>/<name>`` layout
+    under that root instead (pass the same path as ``data.teacher_root`` in the
+    training config).
+    """
     p = Path(noisy_path)
-    return p.with_name(p.name.replace("NOISY", "TEACHER"))
+    name = p.name.replace("NOISY", "TEACHER")
+    if out_root:
+        return Path(out_root) / p.parent.name / name
+    return p.with_name(name)
 
 
 def main():
@@ -81,6 +91,12 @@ def main():
     ap.add_argument("--overlap", type=int, default=64)
     ap.add_argument("--overwrite", action="store_true", help="recompute even if output exists")
     ap.add_argument("--limit", type=int, default=0, help="process only first N pairs (0 = all)")
+    ap.add_argument(
+        "--out-root",
+        default=None,
+        help="write TEACHER PNGs under this root (mirroring <scene>/<name>) instead of "
+        "next to the noisy files; match data.teacher_root in the training config",
+    )
     args = ap.parse_args()
 
     from ..bench.third_party.nafnet import NAFNet
@@ -104,10 +120,11 @@ def main():
     n_done = 0
     n_skip = 0
     for i, (noisy_path, _gt_path) in enumerate(pairs):
-        out_path = teacher_path_for(noisy_path)
+        out_path = teacher_path_for(noisy_path, args.out_root)
         if out_path.exists() and not args.overwrite:
             n_skip += 1
             continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         img_np = np.array(Image.open(noisy_path).convert("RGB"), dtype=np.float32) / 255.0
         img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)

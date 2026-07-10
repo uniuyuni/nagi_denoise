@@ -100,6 +100,24 @@ class NagiDistillLoss(nn.Module):
         }
 
 
+def masked_teacher_charbonnier(
+    pred_c: torch.Tensor,
+    teacher_c: torch.Tensor,
+    has_teacher: torch.Tensor,
+    eps: float = 1.0e-3,
+) -> torch.Tensor:
+    """Per-sample Charbonnier(pred, teacher) averaged over teacher-bearing samples.
+
+    Both inputs are expected in asinh-compressed space. ``has_teacher`` is a
+    (B,) {0,1} mask; samples without a precomputed teacher contribute nothing.
+    Returns 0 when the batch has no teacher samples (NaN-safe).
+    """
+    diff = pred_c - teacher_c
+    per = torch.sqrt(diff * diff + float(eps) ** 2).flatten(1).mean(dim=1)  # (B,)
+    ht = has_teacher.to(pred_c.dtype).view(-1)
+    return (per * ht).sum() / ht.sum().clamp_min(1.0)
+
+
 class NagiLoss(nn.Module):
     """Composite loss for Nagi NR training.
 
@@ -241,6 +259,7 @@ class NagiV2Loss(nn.Module):
         compress_fn,
         final_weight: float = 1.0,
         base_weight: float = 0.35,
+        fft_weight: float = 0.0,
         srgb_weight: float = 0.0,
         srgb_base_weight: float = 0.0,
         body_srgb_weight: float = 0.0,
@@ -283,6 +302,8 @@ class NagiV2Loss(nn.Module):
         self.compress_fn = compress_fn
         self.final_weight = float(final_weight)
         self.base_weight = float(base_weight)
+        self.fft_weight = float(fft_weight)
+        self.fft = FFTL1()
         self.srgb_weight = float(srgb_weight)
         self.srgb_base_weight = float(srgb_base_weight)
         self.body_srgb_weight = float(body_srgb_weight)
@@ -389,6 +410,11 @@ class NagiV2Loss(nn.Module):
             "final": loss_final.detach(),
             "base": loss_base.detach(),
         }
+
+        if self.fft_weight > 0:
+            loss_fft = self.fft(output_c, target_c)
+            total = total + self.fft_weight * loss_fft
+            out["fft"] = loss_fft.detach()
 
         if self.srgb_weight > 0 or self.srgb_base_weight > 0:
             target_srgb = linear_to_srgb(target)

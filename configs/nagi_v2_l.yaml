@@ -1,0 +1,97 @@
+# NagiV2-L from-scratch training recipe (Phase 1).
+#
+# Purpose:
+#   Train the 15.4M-param v2-l preset from identity init on a mixture of
+#   SIDD real pairs, PolyU real pairs, and physically-based synthetic
+#   Poisson-Gaussian noise in linear space. Loss follows the proven
+#   NagiPerfect/NagiV2 from-scratch lineage (Charbonnier in asinh-compressed
+#   space + FFT magnitude + clamped linear term + highlight/detail guards).
+#
+# Device is intentionally NOT set here — pass --device to the trainer CLI
+# (mps for the M1 production run, cpu for sanity/smoke checks).
+#
+# Run:
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l --device mps --ckpt-prefix nagi_v2_l
+
+model:
+  kind: nagi_v2
+  preset: v2-l                     # width 64, enc (2,2,4), mid 6, dec (1,2,2) = 15.430M
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0     # in-graph HDR safety: keep enabled (NaN@step500 lesson)
+  confidence_bias: -2.0            # confidence gate starts nearly closed
+
+data:
+  patch_size: 256
+  # Mixture sampling weights per batch element (normalized internally).
+  mixture:
+    sidd: 0.6
+    polyu: 0.2
+    synthetic: 0.2
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  # Shared log-uniform exposure jitter. For real pairs it scales noisy/clean
+  # together (preserves the physical noise/signal ratio); for synthetic pairs
+  # it is applied to the clean image BEFORE noise injection.
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  # Fresh random crops every iteration; the source image is re-drawn every
+  # burst_length samples to amortize the ~1s SIDD PNG decode.
+  burst_length: 8
+  num_workers: 2
+  # Physically-based synthetic noise (linear light, 1.0 = SDR white):
+  #   noisy = clean + sqrt(a*clean + b) * N(0,1),  (a, b) log-uniform per image.
+  # ISO ladder anchors (sigma at mid-gray 0.18 / deep shadow 0.01):
+  #   a=3e-4, b=1e-6  -> sigma ~0.0074 / 0.0020   (clean-ish ISO800-class)
+  #   a=2e-3, b=1e-4  -> sigma ~0.0068+read; mid ISO3200-6400-class
+  #   a=2e-2, b=1e-3  -> sigma ~0.068  / 0.035    (brutal ISO25600-class)
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    # Mild chroma-correlated component: with prob chroma_noise_prob, add a
+    # spatially-correlated zero-luma chroma noise field at chroma_noise_scale
+    # of the local Poisson-Gaussian sigma (mimics demosaicked chroma blotch).
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+  # Optional root holding precomputed NAFNet teacher PNGs (see
+  # nagi_denoise.pipeline.precompute_teacher --out-root). null = look for
+  # *_TEACHER_SRGB_*.PNG next to the SIDD noisy files (the default layout).
+  teacher_root: null
+
+train:
+  # M1 16GB MPS: start at batch 8 (patch 256). If memory pressure appears,
+  # drop batch_size and raise grad_accum_steps to keep effective batch 8.
+  batch_size: 8
+  grad_accum_steps: 1
+  total_iters: 150000              # override with --max-iters for debug runs
+  warmup_iters: 2000
+  lr: 2.0e-4
+  lr_min: 1.0e-6                   # cosine 2e-4 -> 1e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 5000
+  keep_last_ckpts: 5
+  skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
+
+loss:
+  # Proven from-scratch base recipe (NagiPerfect pilot lineage).
+  final_weight: 1.0                # Charbonnier in asinh-compressed space
+  base_weight: 0.35                # base head must stay a good denoiser
+  fft_weight: 0.05                 # FFT magnitude L1 in compressed space
+  linear_weight: 0.08              # clamped linear-space term
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14
+  confidence_l1_weight: 0.002      # keeps the gate from restoring noise as texture
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  # Distillation vs precomputed NAFNet-w64 outputs (SIDD samples that have a
+  # teacher PNG only). If no teacher files exist the trainer warns and the
+  # term contributes exactly 0 (no crash).
+  distill_weight: 0.05

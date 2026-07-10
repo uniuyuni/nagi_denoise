@@ -15,9 +15,17 @@ import yaml
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from ..data import ChunkedShuffleSampler, SIDDPatchDataset, WeakTeacherPatchDataset, find_polyu_pairs, find_sidd_pairs
+from ..data import (
+    ChunkedShuffleSampler,
+    MIXTURE_SOURCE_NAMES,
+    MixturePatchDataset,
+    SIDDPatchDataset,
+    WeakTeacherPatchDataset,
+    find_polyu_pairs,
+    find_sidd_pairs,
+)
 from ..devices import resolve_device
-from ..losses import NagiV2Loss
+from ..losses import NagiV2Loss, masked_teacher_charbonnier
 from ..models.nagi_v2 import NagiV2, build_nagi_v2
 from ..transforms import linear_to_srgb
 
@@ -276,60 +284,122 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     data_cfg = cfg["data"]
-    pairs = None
-    max_pairs = int(data_cfg.get("max_pairs", 0))
-    if max_pairs > 0:
-        pairs = find_sidd_pairs(args.sidd_root)[:max_pairs]
+    loss_cfg = cfg["loss"]
+    distill_weight = float(loss_cfg.get("distill_weight", 0.0))
+    mixture_cfg = data_cfg.get("mixture")
 
-    polyu_root = data_cfg.get("polyu_root")
-    if polyu_root:
-        sidd_pairs = pairs if pairs is not None else find_sidd_pairs(args.sidd_root)
-        polyu_pairs = find_polyu_pairs(
-            str(polyu_root),
-            split=str(data_cfg.get("polyu_split", "CroppedImages")),
+    if mixture_cfg:
+        # ---- Mixture path: infinite stream over {SIDD, PolyU, synthetic}. ----
+        sidd_pairs = find_sidd_pairs(args.sidd_root)
+        max_pairs = int(data_cfg.get("max_pairs", 0))
+        if max_pairs > 0:
+            sidd_pairs = sidd_pairs[:max_pairs]
+        polyu_pairs: list[tuple[str, str]] = []
+        polyu_root = data_cfg.get("polyu_root")
+        if polyu_root:
+            polyu_pairs = find_polyu_pairs(
+                str(polyu_root), split=str(data_cfg.get("polyu_split", "CroppedImages"))
+            )
+            max_polyu_pairs = int(data_cfg.get("polyu_max_pairs", 0))
+            if max_polyu_pairs > 0:
+                polyu_pairs = polyu_pairs[:max_polyu_pairs]
+        synth_cfg = dict(data_cfg.get("synthetic") or {})
+        teacher_root = data_cfg.get("teacher_root")
+        ds = MixturePatchDataset(
+            sidd_pairs=sidd_pairs,
+            polyu_pairs=polyu_pairs,
+            weights=dict(mixture_cfg),
+            patch_size=int(data_cfg["patch_size"]),
+            exposure_jitter=tuple(data_cfg["exposure_jitter"]) if data_cfg.get("exposure_jitter") else None,
+            flip_rot=bool(data_cfg.get("flip_rot", True)),
+            seed=args.seed,
+            burst_length=int(data_cfg.get("burst_length", 8)),
+            teacher_root=str(teacher_root) if teacher_root else None,
+            with_teacher=distill_weight > 0.0,
+            synth_a_range=tuple(synth_cfg.get("a_range", (3.0e-4, 2.0e-2))),
+            synth_b_range=tuple(synth_cfg.get("b_range", (1.0e-6, 1.0e-3))),
+            synth_chroma_prob=float(synth_cfg.get("chroma_noise_prob", 0.5)),
+            synth_chroma_scale=float(synth_cfg.get("chroma_noise_scale", 0.35)),
         )
-        max_polyu_pairs = int(data_cfg.get("polyu_max_pairs", 0))
-        if max_polyu_pairs > 0:
-            polyu_pairs = polyu_pairs[:max_polyu_pairs]
-        if not polyu_pairs:
-            raise FileNotFoundError(f"No PolyU real/mean pairs discovered under {polyu_root}")
-        pairs = list(sidd_pairs) + list(polyu_pairs)
-        print(f"extra PolyU pairs: {len(polyu_pairs)}")
+        num_workers = int(data_cfg.get("num_workers", 1))
+        dl_kwargs = dict(
+            batch_size=int(cfg["train"]["batch_size"]),
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(num_workers > 0),
+        )
+        if num_workers > 0 and "prefetch_factor" in data_cfg:
+            dl_kwargs["prefetch_factor"] = int(data_cfg["prefetch_factor"])
+        dl = DataLoader(ds, **dl_kwargs)
+        print(
+            f"mixture weights: {ds.weights} | sidd pairs: {len(sidd_pairs)} "
+            f"polyu pairs: {len(polyu_pairs)} clean images (synth): {len(ds._clean_paths)}"
+        )
+        if distill_weight > 0.0:
+            if ds.num_teacher_files == 0:
+                print(
+                    "WARNING: loss.distill_weight > 0 but no precomputed teacher outputs "
+                    "were found (run nagi_denoise.pipeline.precompute_teacher). "
+                    "The distillation term will be zero for every sample."
+                )
+            else:
+                print(f"teacher outputs available for {ds.num_teacher_files}/{len(sidd_pairs)} SIDD pairs")
+    else:
+        pairs = None
+        max_pairs = int(data_cfg.get("max_pairs", 0))
+        if max_pairs > 0:
+            pairs = find_sidd_pairs(args.sidd_root)[:max_pairs]
 
-    ds = SIDDPatchDataset(
-        root=args.sidd_root,
-        patch_size=int(data_cfg["patch_size"]),
-        patches_per_image=int(data_cfg["patches_per_image"]),
-        exposure_jitter=tuple(data_cfg["exposure_jitter"]) if data_cfg.get("exposure_jitter") else None,
-        flip_rot=bool(data_cfg.get("flip_rot", True)),
-        seed=args.seed,
-        pairs=pairs,
-        synth_prob=float(data_cfg.get("synth_prob", 0.0)),
-        gauss_sigma_max=float(data_cfg.get("gauss_sigma_max", 30.0)),
-        poisson_lambda_range=tuple(data_cfg.get("poisson_lambda_range", (10.0, 100.0))),
-        jpeg_q_range=tuple(data_cfg.get("jpeg_q_range", (60, 100))),
-        return_teacher=False,
-        output_space="linear",
-        randomize_each_access=bool(data_cfg.get("randomize_each_access", True)),
-    )
-    num_workers = int(data_cfg.get("num_workers", 1))
-    sampler = ChunkedShuffleSampler(
-        num_pairs=len(ds.pairs),
-        patches_per_image=ds.patches_per_image,
-        chunk_size=int(data_cfg.get("chunk_size", ds.patches_per_image)),
-        seed=args.seed,
-    )
-    dl_kwargs = dict(
-        batch_size=int(cfg["train"]["batch_size"]),
-        sampler=sampler,
-        num_workers=num_workers,
-        drop_last=True,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
-    )
-    if num_workers > 0 and "prefetch_factor" in data_cfg:
-        dl_kwargs["prefetch_factor"] = int(data_cfg["prefetch_factor"])
-    dl = DataLoader(ds, **dl_kwargs)
+        polyu_root = data_cfg.get("polyu_root")
+        if polyu_root:
+            sidd_pairs = pairs if pairs is not None else find_sidd_pairs(args.sidd_root)
+            polyu_pairs = find_polyu_pairs(
+                str(polyu_root),
+                split=str(data_cfg.get("polyu_split", "CroppedImages")),
+            )
+            max_polyu_pairs = int(data_cfg.get("polyu_max_pairs", 0))
+            if max_polyu_pairs > 0:
+                polyu_pairs = polyu_pairs[:max_polyu_pairs]
+            if not polyu_pairs:
+                raise FileNotFoundError(f"No PolyU real/mean pairs discovered under {polyu_root}")
+            pairs = list(sidd_pairs) + list(polyu_pairs)
+            print(f"extra PolyU pairs: {len(polyu_pairs)}")
+
+        ds = SIDDPatchDataset(
+            root=args.sidd_root,
+            patch_size=int(data_cfg["patch_size"]),
+            patches_per_image=int(data_cfg["patches_per_image"]),
+            exposure_jitter=tuple(data_cfg["exposure_jitter"]) if data_cfg.get("exposure_jitter") else None,
+            flip_rot=bool(data_cfg.get("flip_rot", True)),
+            seed=args.seed,
+            pairs=pairs,
+            synth_prob=float(data_cfg.get("synth_prob", 0.0)),
+            gauss_sigma_max=float(data_cfg.get("gauss_sigma_max", 30.0)),
+            poisson_lambda_range=tuple(data_cfg.get("poisson_lambda_range", (10.0, 100.0))),
+            jpeg_q_range=tuple(data_cfg.get("jpeg_q_range", (60, 100))),
+            return_teacher=False,
+            output_space="linear",
+            randomize_each_access=bool(data_cfg.get("randomize_each_access", True)),
+        )
+        num_workers = int(data_cfg.get("num_workers", 1))
+        sampler = ChunkedShuffleSampler(
+            num_pairs=len(ds.pairs),
+            patches_per_image=ds.patches_per_image,
+            chunk_size=int(data_cfg.get("chunk_size", ds.patches_per_image)),
+            seed=args.seed,
+        )
+        dl_kwargs = dict(
+            batch_size=int(cfg["train"]["batch_size"]),
+            sampler=sampler,
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(num_workers > 0),
+        )
+        if num_workers > 0 and "prefetch_factor" in data_cfg:
+            dl_kwargs["prefetch_factor"] = int(data_cfg["prefetch_factor"])
+        dl = DataLoader(ds, **dl_kwargs)
 
     weak_dl = None
     weak_cfg = dict(cfg.get("weak_teacher") or {})
@@ -408,6 +478,7 @@ def main() -> None:
         compress_fn=model.compress,
         final_weight=float(loss_cfg.get("final_weight", 1.0)),
         base_weight=float(loss_cfg.get("base_weight", 0.35)),
+        fft_weight=float(loss_cfg.get("fft_weight", 0.0)),
         srgb_weight=float(loss_cfg.get("srgb_weight", 0.0)),
         srgb_base_weight=float(loss_cfg.get("srgb_base_weight", 0.0)),
         body_srgb_weight=float(loss_cfg.get("body_srgb_weight", 0.0)),
@@ -448,7 +519,8 @@ def main() -> None:
     ).to(device)
 
     print(f"device: {device}")
-    print(f"pairs: {len(ds.pairs)}, dataset items: {len(ds)}")
+    if not mixture_cfg:
+        print(f"pairs: {len(ds.pairs)}, dataset items: {len(ds)}")
     print(f"params: {model.param_count() / 1e6:.3f}M")
     print(f"effective batch: {cfg['train']['batch_size']} x {accum_steps}")
     print(f"output: {out_dir}")
@@ -526,6 +598,7 @@ def main() -> None:
     weak_iter = iter(weak_dl) if weak_dl is not None else None
     step = start_step
     t0 = time.time()
+    source_counts: dict[str, int] = {}
     model.train()
     while step < total_iters:
         cur_lr = lr_at(step, total_iters, warmup, lr, lr_min)
@@ -538,15 +611,37 @@ def main() -> None:
 
         for _ in range(accum_steps):
             try:
-                noisy, clean = next(data_iter)
+                batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(dl)
-                noisy, clean = next(data_iter)
+                batch = next(data_iter)
+
+            teacher = None
+            has_teacher = None
+            if len(batch) == 5:  # mixture: (noisy, clean, teacher, has_teacher, source_id)
+                noisy, clean, teacher, has_teacher, source_id = batch
+                for sid in source_id.tolist():
+                    name = MIXTURE_SOURCE_NAMES.get(int(sid), str(int(sid)))
+                    source_counts[name] = source_counts.get(name, 0) + 1
+            else:
+                noisy, clean = batch
 
             noisy = noisy.to(device, non_blocking=True)
             clean = clean.to(device, non_blocking=True)
             pred = model(noisy, return_aux=True)
             losses = criterion(pred, clean)
+            if teacher is not None and distill_weight > 0.0:
+                teacher = teacher.to(device, non_blocking=True)
+                has_teacher = has_teacher.to(device, non_blocking=True)
+                loss_distill = masked_teacher_charbonnier(
+                    model.compress(pred["output"]),
+                    model.compress(teacher),
+                    has_teacher,
+                    eps=float(loss_cfg.get("charbonnier_eps", 1.0e-3)),
+                )
+                losses["total"] = losses["total"] + distill_weight * loss_distill
+                losses["distill"] = loss_distill.detach()
+                losses["teacher_frac"] = has_teacher.mean().detach()
             if weak_dl is not None and weak_iter is not None:
                 try:
                     weak_noisy, weak_teacher, weak_mask = next(weak_iter)
@@ -645,6 +740,9 @@ def main() -> None:
                 f"final={accum_log['final']:.4f} base={accum_log['base']:.4f} "
             )
             for key in (
+                "fft",
+                "distill",
+                "teacher_frac",
                 "srgb",
                 "srgb_base",
                 "body_srgb",
@@ -688,6 +786,9 @@ def main() -> None:
             ):
                 if key in accum_log:
                     msg += f"{key}={accum_log[key]:.4f} "
+            if source_counts:
+                counts = " ".join(f"src_{name}={source_counts.get(name, 0)}" for name in ("sidd", "polyu", "synthetic"))
+                msg += counts + " "
             msg += f"lr={cur_lr:.2e} ips={ips:.2f}"
             print(msg)
             log_f.write(msg + "\n")
