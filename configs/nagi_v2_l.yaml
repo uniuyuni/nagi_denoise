@@ -39,7 +39,7 @@ data:
   # Fresh random crops every iteration; the source image is re-drawn every
   # burst_length samples to amortize the ~1s SIDD PNG decode.
   burst_length: 8
-  num_workers: 1                   # minimize memory under system-wide pressure
+  num_workers: 2
   # Physically-based synthetic noise (linear light, 1.0 = SDR white):
   #   noisy = clean + sqrt(a*clean + b) * N(0,1),  (a, b) log-uniform per image.
   # ISO ladder anchors (sigma at mid-gray 0.18 / deep shadow 0.01):
@@ -62,8 +62,8 @@ data:
 train:
   # M1 16GB MPS: start at batch 8 (patch 256). If memory pressure appears,
   # drop batch_size and raise grad_accum_steps to keep effective batch 8.
-  batch_size: 1                    # CPU phase: effective batch 8 via accum (GPU busy; see 2026-07-10)
-  grad_accum_steps: 8              # switch to batch 8 x accum 1 when moving to MPS
+  batch_size: 2                    # MPS phase: batch 8 OOM'd at 18GB (unified mem); accum to compensate
+  grad_accum_steps: 4
   total_iters: 150000              # override with --max-iters for debug runs
   warmup_iters: 2000
   lr: 2.0e-4
@@ -72,7 +72,7 @@ train:
   grad_clip: 1.0
   ema_decay: 0.999
   log_every: 50
-  save_every: 1000                 # frequent saves: OOM-kill resilience on CPU phase
+  save_every: 1000                 # keep frequent; supervisor auto-resumes on any kill
   keep_last_ckpts: 5
   skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
 
