@@ -1,0 +1,167 @@
+# NagiV2-L Phase 2 weak-teacher fine-tune.
+#
+# Purpose:
+#   Starting from the Phase 1 from-scratch checkpoint
+#   (runs/nagi_v2_l/nagi_v2_l_final.pt, SIDD Val 39.068 dB), close the
+#   remaining real-photo gap: residual luma noise sitting on top of fine
+#   structure (hair strands, skin texture) that the deterministic flat-chroma
+#   pass cannot touch (its structure-protection gates correctly refuse to
+#   act on real detail).
+#
+#   Supervision is a frequency-split PL-informed pseudo teacher
+#   (nagi_denoise.pipeline.build_pseudo_teacher) applied ONLY through the
+#   luma-HF terms of weak_teacher_loss, gated to flat/non-edge/non-highlight
+#   regions (nagi_denoise.data.WeakTeacherPatchDataset). Chroma weak-teacher
+#   weights are zero: chroma noise is already solved deterministically by
+#   flat_chroma_smoother and PL's color must never leak into the model.
+#
+#   The main SIDD/PolyU/synthetic mixture stays active (at 0.7x its Phase 1
+#   weight via train.main_loss_scale) so the base denoiser doesn't drift and
+#   SIDD Val doesn't regress. train.freeze_trainable_prefixes anchors the
+#   early trunk (intro/encoders/downs/middle) so gradients from the weak
+#   teacher mostly reshape the detail head, confidence head, and the last
+#   decoder stage (which is where a photographer can see hair-detail vs
+#   noise get separated) rather than the whole feature extractor.
+#
+# Run:
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l_ft.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l_ft --device mps --ckpt-prefix nagi_v2_l_ft \
+#       --resume-latest
+
+model:
+  kind: nagi_v2
+  preset: v2-l
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0     # in-graph HDR safety: keep enabled (NaN@step500 lesson)
+  confidence_bias: -2.0            # overwritten by loaded state_dict; kept for shell construction
+
+data:
+  patch_size: 256
+  mixture:
+    sidd: 0.6
+    polyu: 0.2
+    synthetic: 0.2
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  burst_length: 8
+  num_workers: 2
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+  teacher_root: null
+
+train:
+  batch_size: 2                    # same MPS-safe setting as Phase 1 (batch 8 OOM'd)
+  grad_accum_steps: 4
+  total_iters: 8000
+  warmup_iters: 200
+  lr: 2.0e-5
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 5
+  skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
+  # Fine-tune init from the Phase 1 EMA weights, fresh optimizer state.
+  init_checkpoint: runs/nagi_v2_l/nagi_v2_l_final.pt
+  init_state: state_dict           # EMA weights
+  init_strict: true
+  # Down-weight (not remove) the main reconstruction loss so the weak-teacher
+  # luma-HF term has room to act without letting the base denoiser/SIDD drift.
+  main_loss_scale: 0.7
+  # Anchor the early trunk; let detail/confidence heads + late decoder adapt.
+  # base_head stays trainable too (it's still driven by the un-gated main
+  # mixture loss, not by the weak teacher: weak chroma weights are 0 below).
+  freeze_trainable_prefixes:
+    - "detail_head."
+    - "confidence_head."
+    - "base_head."
+    - "decoders.2."
+    - "ups.2."
+
+loss:
+  # Unchanged from Phase 1 (nagi_v2_l.yaml) — scaled as a whole by
+  # train.main_loss_scale above, not re-tuned term by term.
+  final_weight: 1.0
+  base_weight: 0.35
+  fft_weight: 0.05
+  linear_weight: 0.08
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14
+  confidence_l1_weight: 0.002
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  distill_weight: 0.0               # no precomputed-teacher PNGs needed here
+
+# Weak-teacher pseudo supervision (Phase 2). Pairs built by
+# nagi_denoise.pipeline.build_pseudo_teacher from NagiV2(+chroma pass) bases
+# and PL DeepPrime XD, frequency-split so only local HF residual is borrowed.
+weak_teacher:
+  enabled: true
+  pairs:
+    - noisy: "/Users/uniuyuni/ProjectData/test_photos/X-T5 Occi noisy.EXR"
+      teacher: runs/nagi_v2_l_weak/pseudo_teacher/xt5_occi_frequency_split_pseudo_teacher.exr
+    - noisy: "/Users/uniuyuni/ProjectData/test_photos/K-5 Dance noisy.EXR"
+      teacher: runs/nagi_v2_l_weak/pseudo_teacher/k5_dance_frequency_split_pseudo_teacher.exr
+    - noisy: "/Users/uniuyuni/ProjectData/test_photos/K-5 Ice noisy.EXR"
+      teacher: runs/nagi_v2_l_weak/pseudo_teacher/k5_ice_frequency_split_pseudo_teacher.exr
+    - noisy: "/Users/uniuyuni/ProjectData/test_photos/X-T5 Cat noisy.EXR"
+      teacher: runs/nagi_v2_l_weak/pseudo_teacher/xt5_cat_frequency_split_pseudo_teacher.exr
+  patch_size: 256
+  patches_per_image: 48
+  chunk_size: 48
+  batch_size: 2
+  num_workers: 0
+  exposure_jitter: null            # keep the pseudo teacher's tone/gate relationship intact
+  flip_rot: true
+  seed_offset: 100000
+  # Mask-construction params (see WeakTeacherPatchDataset._make_mask): flat,
+  # non-edge, non-highlight, and "actually changed vs noisy" regions only.
+  structure_sigma: 1.2
+  detail_sigma: 2.8
+  detail_threshold: 0.018
+  detail_transition: 0.010
+  edge_sigma: 1.0
+  edge_threshold: 0.030
+  edge_transition: 0.015
+  highlight_threshold: 1.0
+  highlight_transition: 0.25
+  delta_threshold: 0.002
+  delta_transition: 0.010
+  min_mask_mean: 0.02
+  # Overall weight of the weak-teacher term added to the (scaled) main loss.
+  weight: 0.5
+  # Luma: the axis we're actually trying to fix (noise sitting on structure).
+  luma_weight: 0.15
+  luma_hf_weight: 0.6
+  luma_hf_tail_weight: 0.3         # extra pressure on the worst 8% HF pixels (noisy tail)
+  luma_hf_tail_fraction: 0.08
+  hf_kernel_size: 9
+  # Chroma: deliberately near-zero. Chroma is already solved by the
+  # deterministic flat_chroma_smoother pass; PL's color must not leak in.
+  chroma_weight: 0.0
+  chroma_hf_weight: 0.0
+  chroma_hf_tail_weight: 0.0
+  chroma_hf_tail_fraction: 0.02
+  chroma_axis_hf_weight: 0.0
+  chroma_axis_hf_tail_weight: 0.0
+  chroma_axis_hf_tail_fraction: 0.02
+  magenta_axis_hf_weight: 0.0
+  magenta_axis_hf_tail_weight: 0.0
+  magenta_axis_hf_tail_fraction: 0.02
+  # No chroma-cleanup branch in v2-l -> output_pre_cleanup == output_pre_guard;
+  # baseline_* terms would be a no-op comparison, leave at 0.
+  baseline_luma_weight: 0.0
+  baseline_chroma_weight: 0.0
+  baseline_chroma_hf_weight: 0.0

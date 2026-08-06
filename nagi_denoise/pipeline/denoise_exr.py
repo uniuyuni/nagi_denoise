@@ -215,6 +215,7 @@ def load_model(weights: Path, device: torch.device, state_key: str) -> NagiV2:
     cfg = ckpt.get("config", {})
     model_cfg = dict((cfg.get("model") or {}))
     model_cfg.pop("kind", None)
+    model_cfg.pop("arch", None)
     preset = model_cfg.pop("preset", None)
     if preset:
         model = build_nagi_v2_preset(str(preset))

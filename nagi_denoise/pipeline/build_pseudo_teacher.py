@@ -27,9 +27,13 @@ from .probe import image_stats, make_preview, read_image
 ROOT = Path(__file__).resolve().parents[2]
 TEST_PHOTOS = Path("/Users/uniuyuni/ProjectData/test_photos")
 # Frozen quality baseline from the pre-NagiV2 pipeline (see runs/baseline_v12/).
-# Phase 2 will re-point these at NagiV2 base outputs.
+# Read-only reference for comparisons; Phase 2 pseudo-teacher bases below now
+# point at NagiV2 (+ deterministic chroma pass) outputs instead.
 RUN_ROOT = ROOT / "runs/baseline_v12"
 BEST = RUN_ROOT
+# Phase 2: NagiV2-L + flat_chroma_smoother outputs, used as the pseudo-teacher
+# base for all weak-teacher scenes (see runs/nagi_v2_l_weak/base/).
+NAGI_V2_WEAK_BASE = ROOT / "runs/nagi_v2_l_weak/base"
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,7 @@ SCENES: dict[str, Scene] = {
     "xt5_occi": Scene(
         "xt5_occi",
         TEST_PHOTOS / "X-T5 Occi noisy.EXR",
-        BEST / "xt5_occi_scunet_preset_chooser_v12_auto.exr",
+        NAGI_V2_WEAK_BASE / "xt5_occi_nagi_v2_chroma.exr",
         TEST_PHOTOS / "X-T5 Occi PL deepprimeXD.tif",
         (
             ("face_center", 2120, 1260),
@@ -58,7 +62,7 @@ SCENES: dict[str, Scene] = {
     "k5_dance": Scene(
         "k5_dance",
         TEST_PHOTOS / "K-5 Dance noisy.EXR",
-        BEST / "k5_dance_scunet_preset_chooser_v12_auto.exr",
+        NAGI_V2_WEAK_BASE / "k5_dance_nagi_v2_chroma.exr",
         TEST_PHOTOS / "K-5 Dance PL deepprimeXD.tif",
         (
             ("sky_existing", 4096, 0),
@@ -71,7 +75,7 @@ SCENES: dict[str, Scene] = {
     "k5_ice": Scene(
         "k5_ice",
         TEST_PHOTOS / "K-5 Ice noisy.EXR",
-        RUN_ROOT / "final_v4_red115_blue120_detailguard_mild/k5_ice_final_v4_red115_blue120_detailguard_mild.exr",
+        NAGI_V2_WEAK_BASE / "k5_ice_nagi_v2_chroma.exr",
         TEST_PHOTOS / "K-5 Ice PL deepprimeXD.tif",
         (
             ("ice_center", 2100, 1180),
@@ -82,7 +86,7 @@ SCENES: dict[str, Scene] = {
     "xt5_cat": Scene(
         "xt5_cat",
         TEST_PHOTOS / "X-T5 Cat noisy.EXR",
-        RUN_ROOT / "final_v4_red115_blue120_detailguard_mild/xt5_cat_final_v4_red115_blue120_detailguard_mild.exr",
+        NAGI_V2_WEAK_BASE / "xt5_cat_nagi_v2_chroma.exr",
         TEST_PHOTOS / "X-T5 Cat PL deepprimeXD.tif",
         (
             ("fur_detail", 1808, 556),
@@ -324,7 +328,7 @@ def save_compare(scene: Scene, result: Path, out_dir: Path, crop_size: int, scal
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build PL-informed frequency-split pseudo teacher.")
     parser.add_argument("--scene", required=True, choices=sorted(SCENES))
-    parser.add_argument("--output-dir", default=str(RUN_ROOT / "frequency_split_pseudo_teacher_v1"))
+    parser.add_argument("--output-dir", default=str(ROOT / "runs/nagi_v2_l_weak/pseudo_teacher"))
     parser.add_argument("--name", default=None)
     parser.add_argument("--tone-sigma", type=float, default=28.0)
     parser.add_argument("--flat-strength", type=float, default=0.72)

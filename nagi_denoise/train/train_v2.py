@@ -465,6 +465,7 @@ def main() -> None:
     accum_steps = int(train_cfg.get("grad_accum_steps", 1))
     keep_last = int(train_cfg.get("keep_last_ckpts", 0))
     skip_nonfinite = bool(train_cfg.get("skip_nonfinite", False))
+    main_loss_scale = float(train_cfg.get("main_loss_scale", 1.0))
     prefix = args.ckpt_prefix
 
     opt = AdamW(
@@ -569,7 +570,23 @@ def main() -> None:
                 print(f"missing keys: {model_result.missing_keys}")
                 print(f"unexpected keys: {model_result.unexpected_keys}")
 
-    if bool(train_cfg.get("freeze_for_chroma_branch", False)):
+    freeze_trainable_prefixes_cfg = train_cfg.get("freeze_trainable_prefixes")
+    if freeze_trainable_prefixes_cfg is not None:
+        # Generic partial-freeze: no chroma-branch requirement. Used e.g. by the
+        # Phase 2 weak-teacher fine-tune to anchor the early trunk (keeps SIDD
+        # quality + chroma stable) while letting the detail/confidence heads and
+        # late decoder stage adapt.
+        trainable_prefixes = tuple(str(p) for p in freeze_trainable_prefixes_cfg)
+        if not trainable_prefixes:
+            raise ValueError("freeze_trainable_prefixes must not be empty")
+        for name, param in model.named_parameters():
+            param.requires_grad_(any(name.startswith(prefix) for prefix in trainable_prefixes))
+        for name, param in ema.named_parameters():
+            param.requires_grad_(False)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"freeze_trainable_prefixes: prefixes={trainable_prefixes}, trainable={trainable}/{total_params}")
+    elif bool(train_cfg.get("freeze_for_chroma_branch", False)):
         if (
             getattr(model, "chroma_head", None) is None
             and getattr(model, "chroma_smooth_head", None) is None
@@ -630,6 +647,8 @@ def main() -> None:
             clean = clean.to(device, non_blocking=True)
             pred = model(noisy, return_aux=True)
             losses = criterion(pred, clean)
+            if main_loss_scale != 1.0:
+                losses["total"] = losses["total"] * main_loss_scale
             if teacher is not None and distill_weight > 0.0:
                 teacher = teacher.to(device, non_blocking=True)
                 has_teacher = has_teacher.to(device, non_blocking=True)
