@@ -23,8 +23,9 @@ This module ships:
   * `ChunkedShuffleSampler` — yields indices grouped by image so the cache hits.
   * `PolyUPatchDataset` — same treatment for PolyU CroppedImages real pairs.
   * `apply_poisson_gaussian_linear` — physically-based heteroscedastic
-    Poisson-Gaussian noise in linear light (ISO-ladder a/b, optional
-    chroma-correlated component).
+    Poisson-Gaussian noise in linear light (ISO-ladder a/b, per-image spatial
+    correlation via `correlated_standard_normal`, optional chroma-correlated
+    component).
   * `MixturePatchDataset` — infinite IterableDataset mixing {SIDD real,
     PolyU real, synthetic} pairs with configurable weights; also carries the
     precomputed NAFNet teacher output for SIDD samples (distillation).
@@ -618,32 +619,69 @@ def sample_poisson_gaussian_params(
     return a, b
 
 
+def correlated_standard_normal(
+    rng: np.random.Generator,
+    shape: Tuple[int, ...],
+    sigma: float,
+) -> np.ndarray:
+    """Draw a unit-std, spatially-correlated standard-normal field.
+
+    ``shape`` is ``(C, H, W)`` (or ``(1, H, W)`` for a single-channel field).
+    Draws i.i.d. ``N(0,1)``, then — when ``sigma > 0`` — Gaussian-blurs each
+    channel independently (``scipy.ndimage.gaussian_filter``, ``mode="reflect"``)
+    and renormalizes each channel back to unit std, so the caller's intended
+    noise magnitude (``sqrt(a*clean+b)``) is preserved regardless of ``sigma``.
+
+    Calibrated against real-photo demosaiced noise (lag-1 autocorrelation of
+    the residual after a 3x3 median): sigma=0.5 -> ~0.005 (still white),
+    sigma=0.7 -> ~0.217 (matches Fujifilm X-T5 luma, +0.235), sigma=0.9 ->
+    ~0.365 (PolyU range). ``sigma <= 0`` returns plain white noise unchanged.
+    """
+    field = rng.standard_normal(shape).astype(np.float32)
+    if sigma <= 0.0:
+        return field
+    from scipy.ndimage import gaussian_filter
+
+    out = np.empty_like(field)
+    for c in range(shape[0]):
+        blurred = gaussian_filter(field[c], sigma=sigma, mode="reflect")
+        std = float(blurred.std())
+        out[c] = blurred / std if std > 1.0e-8 else blurred
+    return out
+
+
 def apply_poisson_gaussian_linear(
     rng: np.random.Generator,
     clean_linear: torch.Tensor,
     a: float,
     b: float,
     chroma_scale: float = 0.0,
+    corr_sigma: float = 0.0,
+    chroma_corr_sigma: float = 0.0,
 ) -> torch.Tensor:
     """Add heteroscedastic Poisson-Gaussian noise to a linear-light CHW tensor.
 
-    ``noisy = clean + sqrt(a*clean + b) * N(0,1)``, all float32 linear.
-    Optionally adds a mild chroma-correlated component: a shared 2x-upsampled
-    (spatially correlated) single-channel noise field pushed along a random
-    zero-luma chroma axis, with amplitude ``chroma_scale`` relative to the
-    local Poisson-Gaussian sigma. Output is clamped to >= 0 like the real
+    ``noisy = clean + sqrt(a*clean + b) * N(0,1)``, all float32 linear. The
+    driving noise field is drawn per-channel from ``correlated_standard_normal``
+    with spatial correlation ``corr_sigma`` (pixels; 0 = white, matching plain
+    i.i.d. Gaussian shot/read noise). This models the fact that real demosaiced
+    sensor noise is NOT spatially white (see module-level calibration notes).
+
+    Optionally adds a chroma-correlated component: a single-channel field
+    (its own, typically larger, correlation ``chroma_corr_sigma`` — real
+    chroma noise is correlated out to lag 3) pushed along a random zero-luma
+    chroma axis, with amplitude ``chroma_scale`` relative to the local
+    Poisson-Gaussian sigma. Output is clamped to >= 0 like the real
     sRGB-decoded pairs.
     """
     clean = clean_linear.clamp_min(0.0)
     sigma = torch.sqrt(a * clean + b)
-    noise = torch.from_numpy(rng.standard_normal(tuple(clean.shape)).astype(np.float32))
+    noise = torch.from_numpy(correlated_standard_normal(rng, tuple(clean.shape), corr_sigma))
     noisy = clean + sigma * noise
 
     if chroma_scale > 0.0:
         _, h, w = clean.shape
-        h2, w2 = max(1, h // 2), max(1, w // 2)
-        field = torch.from_numpy(rng.standard_normal((1, 1, h2, w2)).astype(np.float32))
-        field = torch.nn.functional.interpolate(field, size=(h, w), mode="bilinear", align_corners=False)[0]
+        field = torch.from_numpy(correlated_standard_normal(rng, (1, h, w), chroma_corr_sigma))
         axis = rng.standard_normal(3).astype(np.float32)
         axis = axis - float((axis * LUMA_LINEAR).sum())  # remove luma component
         norm = float(np.sqrt((axis * axis).sum()))
@@ -807,6 +845,8 @@ class MixturePatchDataset(IterableDataset):
         synth_b_range: Tuple[float, float] = (1.0e-6, 1.0e-3),
         synth_chroma_prob: float = 0.5,
         synth_chroma_scale: float = 0.35,
+        synth_corr_sigma_range: Tuple[float, float] = (0.0, 1.0),
+        synth_chroma_corr_sigma_range: Tuple[float, float] = (0.8, 2.0),
     ):
         super().__init__()
         if patch_size % 8 != 0:
@@ -822,6 +862,20 @@ class MixturePatchDataset(IterableDataset):
         self.synth_b_range = (float(synth_b_range[0]), float(synth_b_range[1]))
         self.synth_chroma_prob = float(synth_chroma_prob)
         self.synth_chroma_scale = float(synth_chroma_scale)
+        # Per-image spatial correlation (pixels) for the synthetic noise field.
+        # Sampled UNIFORMLY (not log-uniform): the range legitimately includes
+        # 0 (white noise, e.g. matching SIDD's near-white real noise), and
+        # log-uniform is undefined at 0. Uniform sampling also matches how the
+        # calibration was done (sigma swept linearly: 0.5/0.7/0.9 -> lag1
+        # 0.005/0.217/0.365) so training sees a representative spread across
+        # the white-to-correlated range rather than concentrating near 0.
+        self.synth_corr_sigma_range = (float(synth_corr_sigma_range[0]), float(synth_corr_sigma_range[1]))
+        # Chroma field gets its own (typically larger) correlation range;
+        # also sampled uniformly for the same reason.
+        self.synth_chroma_corr_sigma_range = (
+            float(synth_chroma_corr_sigma_range[0]),
+            float(synth_chroma_corr_sigma_range[1]),
+        )
 
         weights = {k: float(v) for k, v in dict(weights).items() if float(v) > 0.0}
         unknown = set(weights) - set(MIXTURE_SOURCE_IDS)
@@ -892,7 +946,14 @@ class MixturePatchDataset(IterableDataset):
             clean = self._to_linear(clean_u8) * scale  # exposure jitter FIRST
             a, b = sample_poisson_gaussian_params(rng, self.synth_a_range, self.synth_b_range)
             chroma_scale = self.synth_chroma_scale if rng.random() < self.synth_chroma_prob else 0.0
-            noisy = apply_poisson_gaussian_linear(rng, clean, a, b, chroma_scale=chroma_scale)
+            corr_sigma = float(rng.uniform(*self.synth_corr_sigma_range))
+            chroma_corr_sigma = float(rng.uniform(*self.synth_chroma_corr_sigma_range)) if chroma_scale > 0.0 else 0.0
+            noisy = apply_poisson_gaussian_linear(
+                rng, clean, a, b,
+                chroma_scale=chroma_scale,
+                corr_sigma=corr_sigma,
+                chroma_corr_sigma=chroma_corr_sigma,
+            )
             teacher = clean
             has_teacher = 0.0
             views = self._augment(rng, [noisy, clean])

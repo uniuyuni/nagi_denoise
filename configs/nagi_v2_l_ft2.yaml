@@ -1,0 +1,121 @@
+# NagiV2-L Phase 2B correlated-noise fine-tune.
+#
+# Purpose:
+#   Phase 1 (runs/nagi_v2_l/nagi_v2_l_final.pt, SIDD Val 39.068 dB) leaves
+#   visible noise on hair/skin in real high-ISO photos. Root cause: the
+#   Phase 1 training mixture (sidd 0.6 / polyu 0.2 / synthetic 0.2) was ~80%
+#   spatially-white noise (SIDD real lag1 autocorr +0.024, synthetic -0.146),
+#   while real demosaiced sensor noise is spatially CORRELATED (X-T5 luma
+#   +0.235, PolyU +0.27..+0.48). A model trained almost entirely on white
+#   noise learns "isolated pixel deviation = noise" and preserves real
+#   correlated noise blobs as if they were fine structure.
+#
+#   Phase 2A (runs/nagi_v2_l_ft, abandoned) tried to fix this indirectly via
+#   a PL-informed weak-teacher pseudo-supervision term with a frozen trunk;
+#   it only reached +6.3pt selectivity (vs v12's +9.8pt) and PL was later
+#   found to be pixel-misaligned with our EXRs (unusable as a pixel teacher).
+#
+#   Phase 2B instead fixes the training DATA directly:
+#   nagi_denoise.data.apply_poisson_gaussian_linear now draws its noise field
+#   from nagi_denoise.data.correlated_standard_normal, which Gaussian-blurs a
+#   white field per-channel (scipy.ndimage.gaussian_filter) and renormalizes
+#   to unit std, calibrated so sigma=0.7 reproduces the real X-T5 lag1 of
+#   ~0.22-0.24. The mixture below shifts weight from SIDD (white) to PolyU
+#   (real, already correlated) and synthetic (now correlated), and unfreezes
+#   the WHOLE model — Phase 2A's frozen-trunk approach could only reshape the
+#   detail/confidence heads, but the base denoiser itself has to relearn what
+#   noise looks like. The NAFNet distillation term (computed on SIDD's white
+#   noise) is disabled, and there is no weak-teacher section (PL is unusable
+#   as a pixel-level teacher).
+#
+# Run (usually via scripts/train_supervisor_ft2.sh, not directly):
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l_ft2.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l_ft2 --device mps --ckpt-prefix nagi_v2_l_ft2 \
+#       --resume-latest
+
+model:
+  kind: nagi_v2
+  preset: v2-l
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0     # in-graph HDR safety: keep enabled (NaN@step500 lesson)
+  confidence_bias: -2.0            # overwritten by loaded state_dict; kept for shell construction
+
+data:
+  patch_size: 256
+  # Rebalanced toward real-correlated (PolyU) and now-correlated (synthetic)
+  # noise; SIDD kept only to hold the SIDD benchmark from regressing further
+  # than necessary (it is still ~white, so a large weight would fight the
+  # correlated-noise objective).
+  mixture:
+    sidd: 0.25
+    polyu: 0.35
+    synthetic: 0.40
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  burst_length: 8
+  num_workers: 2
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+    # Per-image spatial correlation (pixels) for the main synthetic noise
+    # field. Uniform (not log-uniform) over [0, 1]: the range legitimately
+    # includes 0 (white), and 0.7 alone reproduces the calibrated X-T5 lag1
+    # of ~0.22; sampling the whole range gives the model exposure to the
+    # full white-to-correlated spectrum rather than a single fixed sigma.
+    corr_sigma_range: [0.0, 1.0]
+    # Chroma field gets its own, larger correlation range (real chroma noise
+    # is correlated out to lag 3, +0.169 on X-T5).
+    chroma_corr_sigma_range: [0.8, 2.0]
+  teacher_root: null
+
+train:
+  batch_size: 2                    # MPS-safe: batch 4+ OOMs/swap-thrashes on this M1 16GB machine
+  grad_accum_steps: 4
+  total_iters: 20000
+  warmup_iters: 500
+  lr: 5.0e-5
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 1000
+  keep_last_ckpts: 5
+  skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
+  # Fine-tune init from the Phase 1 EMA weights, fresh optimizer state.
+  init_checkpoint: runs/nagi_v2_l/nagi_v2_l_final.pt
+  init_state: state_dict           # EMA weights
+  init_strict: true
+  # Full model trainable this time (no freeze_trainable_prefixes): the base
+  # denoiser itself has to relearn what noise looks like under a
+  # correlated-noise training distribution, not just the detail/confidence
+  # heads (that was Phase 2A's approach and it undershot).
+
+loss:
+  # Unchanged from Phase 1 (nagi_v2_l.yaml).
+  final_weight: 1.0
+  base_weight: 0.35
+  fft_weight: 0.05
+  linear_weight: 0.08
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14
+  confidence_l1_weight: 0.002
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  # Distillation off: the NAFNet teacher outputs were computed against SIDD's
+  # white noise, which is exactly the assumption this fine-tune is correcting.
+  distill_weight: 0.0
+
+# No weak_teacher section: PL DeepPrime XD outputs are not pixel-aligned with
+# our EXRs (HF correlation ~0.005 at zero offset, ~0.033 best-effort within
+# +-60px search) -- PL applies its own geometry during RAW development, so it
+# is visual-reference only and must not be used as a pixel-level teacher.

@@ -320,6 +320,8 @@ def main() -> None:
             synth_b_range=tuple(synth_cfg.get("b_range", (1.0e-6, 1.0e-3))),
             synth_chroma_prob=float(synth_cfg.get("chroma_noise_prob", 0.5)),
             synth_chroma_scale=float(synth_cfg.get("chroma_noise_scale", 0.35)),
+            synth_corr_sigma_range=tuple(synth_cfg.get("corr_sigma_range", (0.0, 1.0))),
+            synth_chroma_corr_sigma_range=tuple(synth_cfg.get("chroma_corr_sigma_range", (0.8, 2.0))),
         )
         num_workers = int(data_cfg.get("num_workers", 1))
         dl_kwargs = dict(
