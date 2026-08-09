@@ -291,6 +291,7 @@ class NagiV2Loss(nn.Module):
         highlight_ramp_start: float = 0.0,
         highlight_ramp_end: float = 1.0,
         detail_weight: float = 0.12,
+        detail_global_weight: float = 0.0,
         confidence_l1_weight: float = 0.002,
         highlight_threshold: float = 1.0,
         highlight_transition: float = 0.5,
@@ -341,6 +342,7 @@ class NagiV2Loss(nn.Module):
         self.highlight_ramp_start = float(highlight_ramp_start)
         self.highlight_ramp_end = float(highlight_ramp_end)
         self.detail_weight = float(detail_weight)
+        self.detail_global_weight = float(detail_global_weight)
         self.confidence_l1_weight = float(confidence_l1_weight)
         self.highlight_threshold = float(highlight_threshold)
         self.highlight_transition = float(highlight_transition)
@@ -659,10 +661,22 @@ class NagiV2Loss(nn.Module):
             total = total + self.detail_weight * loss_detail
             out["detail_luma"] = loss_detail.detach()
 
-        if confidence is not None and self.confidence_l1_weight > 0:
-            loss_conf = confidence.mean()
-            total = total + self.confidence_l1_weight * loss_conf
-            out["confidence_l1"] = loss_conf.detach()
+        if self.detail_global_weight > 0:
+            # Unlike detail_weight above, this term is NOT highlight-masked: it
+            # rewards restoring luma high-frequency detail everywhere (hair,
+            # skin, shadows included), which is what actually gives the
+            # confidence gate something to open for outside HDR highlights.
+            diff_detail_global = self._luma_detail(output) - self._luma_detail(target)
+            loss_detail_global = torch.sqrt(diff_detail_global.pow(2) + self.charb.eps2).mean()
+            total = total + self.detail_global_weight * loss_detail_global
+            out["detail_luma_global"] = loss_detail_global.detach()
+
+        if confidence is not None:
+            out["confidence_mean"] = confidence.mean().detach()
+            if self.confidence_l1_weight > 0:
+                loss_conf = confidence.mean()
+                total = total + self.confidence_l1_weight * loss_conf
+                out["confidence_l1"] = loss_conf.detach()
 
         out["highlight_mask_mean"] = mask.mean().detach()
         out["body_mask_mean"] = body_mask.mean().detach()

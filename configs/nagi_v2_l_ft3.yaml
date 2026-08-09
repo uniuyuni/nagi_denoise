@@ -1,0 +1,121 @@
+# NagiV2-L Phase 2C: activate the confidence-gated detail path.
+#
+# Diagnosis (see task notes / commit history): the detail head produces a
+# real signal (absmean 0.0457 on an Occi hair crop) but detail_confidence is
+# essentially fully closed (mean 0.00025), so detail_applied is ~zero and the
+# gate has never actually contributed to the output. Root cause: the existing
+# `loss.detail_weight` term in NagiV2Loss is evaluated ONLY inside HDR
+# highlights (masked by `_highlight_mask`), while `confidence_l1_weight`
+# penalizes confidence.mean() everywhere. So the optimizer correctly learned
+# to close the gate globally -- there was no reward for opening it in hair/
+# skin/shadow regions, only cost.
+#
+# Fix: add a new, non-highlight-masked `loss.detail_global_weight` term
+# (nagi_denoise/losses.py NagiV2Loss.forward, logged as detail_luma_global)
+# that rewards restoring luma high-frequency detail everywhere, and remove
+# confidence_l1_weight so nothing is fighting the gate opening. The base
+# denoiser (Phase 2B) is finished and its cleanliness/SIDD number must not
+# regress, so this fine-tune trains ONLY detail_head and confidence_head
+# (train.freeze_trainable_prefixes) and re-biases the loaded confidence head
+# open at init (train.reset_confidence_bias) since confidence_bias below is
+# overwritten by the loaded state_dict.
+#
+# Safety: the detail loss (both the highlight-scoped and the new global term)
+# is measured against EXACT ALIGNED ground truth (SIDD/PolyU/synthetic
+# pairs), so restoring noise as fake texture increases the loss rather than
+# decreasing it -- no adversarial/perceptual term is used. compressed_output_
+# clamp stays enabled and skip_nonfinite stays false per the NaN@step500
+# lesson from Phase 1/2B.
+#
+# EARLY KILL CHECK (see task notes): at iter 500 and 1000, measure
+# detail_confidence.mean() and detail_applied.abs().mean() on an Occi hair
+# crop. Baseline to beat: confidence mean 0.00025, detail_applied absmean
+# 0.000015. If confidence mean has not risen by at least an order of
+# magnitude (>= ~0.005) by iter 1000, stop the run -- the gate did not open.
+#
+# Run (usually via scripts/train_supervisor_ft3.sh, not directly):
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l_ft3.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l_ft3 --device mps --ckpt-prefix nagi_v2_l_ft3 \
+#       --resume-latest
+
+model:
+  kind: nagi_v2
+  preset: v2-l
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0     # in-graph HDR safety: keep enabled (NaN@step500 lesson)
+  confidence_bias: -0.5            # shell construction only; overwritten by loaded state_dict
+                                    # (train.reset_confidence_bias below re-biases the LOADED head)
+
+data:
+  patch_size: 256
+  # Unchanged from Phase 2B: the correlated-noise mixture is what produced
+  # the current +11.2pt selectivity win. Do not revert it.
+  mixture:
+    sidd: 0.25
+    polyu: 0.35
+    synthetic: 0.40
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  burst_length: 8
+  num_workers: 2
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+    corr_sigma_range: [0.0, 1.0]
+    chroma_corr_sigma_range: [0.8, 2.0]
+  teacher_root: null
+
+train:
+  batch_size: 2                    # MPS-safe: batch 4+ OOMs/swap-thrashes on this M1 16GB machine
+  grad_accum_steps: 4
+  total_iters: 5000
+  warmup_iters: 200
+  lr: 1.0e-4                       # higher than Phase 2B's 5e-5: only two small heads, near-zero start
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 6
+  skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
+  # Fine-tune init from the Phase 2B EMA weights, fresh optimizer state.
+  init_checkpoint: runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt
+  init_state: state_dict           # EMA weights
+  init_strict: true
+  # Re-bias the LOADED confidence head open (confidence_bias above is a shell
+  # construction default only -- init_checkpoint overwrites it). Without
+  # this, the fine-tune restarts from the same near-fully-closed gate that
+  # caused the problem.
+  reset_confidence_bias: -0.5
+  # Train ONLY the detail and confidence heads. The base denoiser is
+  # finished (Phase 2B); this protects its cleanliness and the SIDD number.
+  freeze_trainable_prefixes: ["detail_head.", "confidence_head."]
+
+loss:
+  # Unchanged from Phase 2B.
+  final_weight: 1.0
+  base_weight: 0.35
+  fft_weight: 0.05
+  linear_weight: 0.08
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14              # existing highlight-scoped detail term, kept as-is
+  detail_global_weight: 0.30       # NEW: non-highlight-masked reward for the gate to open
+  confidence_l1_weight: 0.0        # was 0.002 in ft2 -- that pressure is what closed the gate
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  # Distillation off, same reasoning as Phase 2B.
+  distill_weight: 0.0
+
+# No weak_teacher section: PL DeepPrime XD outputs are not pixel-aligned with
+# our EXRs and must not be used as a pixel-level teacher (visual reference
+# only). See nagi_v2_l_ft2.yaml for the full alignment-check writeup.

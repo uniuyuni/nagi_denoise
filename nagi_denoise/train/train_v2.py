@@ -513,6 +513,7 @@ def main() -> None:
         highlight_ramp_start=float(loss_cfg.get("highlight_ramp_start", 0.0)),
         highlight_ramp_end=float(loss_cfg.get("highlight_ramp_end", 1.0)),
         detail_weight=float(loss_cfg.get("detail_weight", 0.12)),
+        detail_global_weight=float(loss_cfg.get("detail_global_weight", 0.0)),
         confidence_l1_weight=float(loss_cfg.get("confidence_l1_weight", 0.002)),
         highlight_threshold=float(loss_cfg.get("highlight_threshold", 1.0)),
         highlight_transition=float(loss_cfg.get("highlight_transition", 0.5)),
@@ -571,6 +572,20 @@ def main() -> None:
             if not init_strict:
                 print(f"missing keys: {model_result.missing_keys}")
                 print(f"unexpected keys: {model_result.unexpected_keys}")
+
+        reset_confidence_bias = train_cfg.get("reset_confidence_bias")
+        if reset_confidence_bias is not None:
+            # The loaded state_dict's confidence_head.bias overrides whatever
+            # the model shell's `confidence_bias` constructor arg set, so a
+            # fine-tune meant to re-open a closed confidence gate has to
+            # explicitly re-bias the *loaded* head here rather than relying on
+            # model construction. Applies to both the trainable model and the
+            # EMA copy so they start in sync.
+            bias_value = float(reset_confidence_bias)
+            with torch.no_grad():
+                model.confidence_head.bias.fill_(bias_value)
+                ema.confidence_head.bias.fill_(bias_value)
+            print(f"reset_confidence_bias: set confidence_head.bias to {bias_value}")
 
     freeze_trainable_prefixes_cfg = train_cfg.get("freeze_trainable_prefixes")
     if freeze_trainable_prefixes_cfg is not None:
@@ -785,7 +800,9 @@ def main() -> None:
                 "highlight_chroma",
                 "highlight_ratio",
                 "detail_luma",
+                "detail_luma_global",
                 "confidence_l1",
+                "confidence_mean",
                 "highlight_mask_mean",
                 "highlight_luma_weight",
                 "highlight_chroma_weight",
