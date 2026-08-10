@@ -27,7 +27,7 @@ PYTORCH_ENABLE_MPS_FALLBACK = "1"
 [tasks]
 check-env = "python scripts/check_env.py"
 check-mps = "python scripts/check_env.py --require-mps"
-test = "python tests/test_model.py && python tests/test_denoise_pipeline.py"
+test = "python tests/test_model.py && python tests/test_denoise_pipeline.py && python tests/test_losses.py"
 train-v2-s = "nagi-train-v2 --config configs/nagi_v2_s.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_s --device mps --ckpt-prefix nagi_v2_s --resume-latest"
 eval-sidd-v2 = "nagi-eval-sidd --model nagi_v2 --weights runs/nagi_v2_s/nagi_v2_s_final.pt --device auto"
 eval-sidd-nafnet = "nagi-eval-sidd --model nafnet --weights benchmarks/nafnet/NAFNet-SIDD-width64.pth --device auto"

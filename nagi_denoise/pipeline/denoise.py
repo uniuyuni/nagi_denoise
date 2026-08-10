@@ -300,6 +300,7 @@ def _cli() -> None:
     ap.add_argument("--overlap", type=int, default=64)
     ap.add_argument("--no-chroma-cleanup", action="store_true")
     ap.add_argument("--detail-strength", type=float, default=None)
+    ap.add_argument("--input-blend", type=float, default=0.20)
     ap.add_argument(
         "--highlight-guard",
         default="adaptive",
@@ -329,6 +330,7 @@ def _cli() -> None:
         overlap=args.overlap,
         chroma_cleanup=not args.no_chroma_cleanup,
         detail_strength=args.detail_strength,
+        input_blend=args.input_blend,
         highlight_guard=highlight_guard,
         highlight_guard_transition=args.highlight_guard_transition,
         highlight_guard_strength=args.highlight_guard_strength,

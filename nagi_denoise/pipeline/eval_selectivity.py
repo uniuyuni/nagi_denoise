@@ -139,10 +139,18 @@ def run_candidate(
     tile_size: int = 1024,
     tile_overlap: int = 64,
     chroma_kwargs: dict | None = None,
+    detail_scale: float | None = None,
 ) -> np.ndarray:
     """Run NagiV2 + deterministic chroma pass over the full image; returns
-    linear-light HWC output."""
+    linear-light HWC output.
+
+    ``detail_scale``, if given, overrides ``model.detail_scale`` after
+    loading (Phase 4B: the live continuous detail-strength knob) -- this is
+    the same attribute ``pipeline.denoise``'s ``detail_strength`` maps to.
+    """
     model = load_model(weights, device=device, state_key=state_key)
+    if detail_scale is not None:
+        model.detail_scale = float(detail_scale)
     out, _extras = run_tiled_image(
         model, noisy_image, device=device, tile_size=tile_size, overlap=tile_overlap, diagnostics=False
     )
@@ -164,6 +172,12 @@ def main() -> None:
     parser.add_argument("--tile-overlap", type=int, default=64)
     parser.add_argument("--output-dir", default="runs/phase2b_compare")
     parser.add_argument("--name", default=None, help="Label for this candidate in the report (default: weights stem).")
+    parser.add_argument(
+        "--detail-scale",
+        type=float,
+        default=None,
+        help="Override model.detail_scale after loading (Phase 4B detail-strength knob).",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -177,6 +191,7 @@ def main() -> None:
     candidate_full = run_candidate(
         noisy_full, weights_path, device=device, state_key=args.state_key,
         tile_size=args.tile_size, tile_overlap=args.tile_overlap,
+        detail_scale=args.detail_scale,
     )
 
     noisy_crop = crop_center(noisy_full, args.x, args.y, args.size)

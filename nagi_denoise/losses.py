@@ -3,6 +3,8 @@
 All losses operate in float32 and are safe with HDR-range tensors.
 """
 from __future__ import annotations
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -242,6 +244,112 @@ def _local_lowpass(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return F.avg_pool2d(padded, kernel_size=kernel_size, stride=1)
 
 
+def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur, reflect-padded, gradient-safe.
+
+    ``sigma`` is a Python float (fixed per call site), so the kernel is a
+    plain tensor with no autograd history of its own -- only ``x`` carries
+    gradients through the two conv2d passes.
+    """
+    if sigma <= 0:
+        return x
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    kernel1d = torch.exp(-(coords * coords) / (2.0 * sigma * sigma))
+    kernel1d = kernel1d / kernel1d.sum()
+    channels = x.shape[1]
+    k = kernel1d.numel()
+    weight_h = kernel1d.view(1, 1, 1, k).expand(channels, 1, 1, k).contiguous()
+    weight_v = kernel1d.view(1, 1, k, 1).expand(channels, 1, k, 1).contiguous()
+    out = F.pad(x, (radius, radius, 0, 0), mode="reflect")
+    out = F.conv2d(out, weight_h, groups=channels)
+    out = F.pad(out, (0, 0, radius, radius), mode="reflect")
+    out = F.conv2d(out, weight_v, groups=channels)
+    return out
+
+
+def _srgb_luma_1ch(x: torch.Tensor) -> torch.Tensor:
+    weights = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    return (x[:, :3] * weights).sum(dim=1, keepdim=True)
+
+
+def _texture_energy_map(
+    luma: torch.Tensor,
+    sigmas: tuple[float, ...],
+    pool_size: int,
+) -> torch.Tensor:
+    """Local texture-energy map: HF magnitude (avg over ``sigmas``), pooled.
+
+    hf(x) = |luma - gaussian_blur(luma, sigma)| for each sigma, averaged,
+    then average-pooled into ``pool_size`` x ``pool_size`` windows. This is a
+    *statistic* -- it says how much high-frequency energy lives in a local
+    neighborhood, not where exactly it sits pixel-for-pixel. Comparing these
+    pooled maps (rather than the HF maps directly) is what lets the detail
+    head add plausible texture without needing pixel-exact agreement with
+    the target's grain pattern.
+    """
+    energy = luma.new_zeros(luma.shape)
+    for sigma in sigmas:
+        blurred = _gaussian_blur(luma, float(sigma))
+        energy = energy + (luma - blurred).abs()
+    energy = energy / max(len(sigmas), 1)
+    pool = max(1, int(pool_size))
+    if pool <= 1:
+        return energy
+    return F.avg_pool2d(energy, kernel_size=pool, stride=pool, ceil_mode=True)
+
+
+def texture_stats_loss(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    sigmas: tuple[float, ...] = (1.2, 2.4),
+    pool_size: int = 16,
+    asymmetric: bool = True,
+    eps: float = 1.0e-3,
+) -> torch.Tensor:
+    """Statistical (not pixel-wise) texture-restoration loss.
+
+    Compares LOCAL POOLED high-frequency ENERGY of ``output`` vs ``target``
+    luma (sRGB-encoded luma, matching the eval-selectivity HF definition),
+    never chroma. Because the comparison is on pooled energy statistics
+    rather than raw pixel differences, the loss is satisfied by restoring
+    plausible texture *anywhere* inside a window -- it does not require
+    matching the target's exact noise/grain realization, which is what let
+    Phase 2C's pixel-wise detail term get stuck at zero once the base head
+    already minimized pixel error.
+
+    ``asymmetric=True`` (default) only penalizes energy DEFICITS, i.e. where
+    the candidate has LESS local texture energy than the target. This is the
+    "restore what's missing" framing from the task: suppressing excess
+    texture/noise is already the job of the base denoiser and the existing
+    pixel-wise terms, so this term should not fight that by also penalizing
+    the (rarer, usually harmless) case where the candidate has more energy
+    than target. ``asymmetric=False`` penalizes the energy gap in both
+    directions.
+
+    Uses a "shifted" Charbonnier (``sqrt(d^2 + eps^2) - eps``) instead of the
+    ordinary Charbonnier so the loss is exactly 0 at zero-difference (the
+    ordinary form floors at ``eps`` even for identical inputs).
+
+    Both ``output`` and ``target`` are linear-light RGB[+] tensors; luma-only
+    by construction (chroma channels are never read).
+    """
+    target_srgb = linear_to_srgb(target.clamp_min(0.0))
+    output_srgb = linear_to_srgb(output.clamp_min(0.0))
+    target_y = _srgb_luma_1ch(target_srgb)
+    output_y = _srgb_luma_1ch(output_srgb)
+
+    target_energy = _texture_energy_map(target_y, sigmas, pool_size)
+    output_energy = _texture_energy_map(output_y, sigmas, pool_size)
+
+    if asymmetric:
+        diff = (target_energy - output_energy).clamp_min(0.0)
+    else:
+        diff = target_energy - output_energy
+    eps2 = float(eps) ** 2
+    return (torch.sqrt(diff * diff + eps2) - eps).mean()
+
+
 class NagiV2Loss(nn.Module):
     """Loss for the base/detail/confidence NagiV2 design.
 
@@ -292,6 +400,11 @@ class NagiV2Loss(nn.Module):
         highlight_ramp_end: float = 1.0,
         detail_weight: float = 0.12,
         detail_global_weight: float = 0.0,
+        texture_stats_weight: float = 0.0,
+        texture_stats_sigmas: tuple[float, ...] = (1.2, 2.4),
+        texture_stats_pool: int = 16,
+        texture_stats_asymmetric: bool = True,
+        texture_stats_eps: float = 1.0e-3,
         confidence_l1_weight: float = 0.002,
         highlight_threshold: float = 1.0,
         highlight_transition: float = 0.5,
@@ -343,6 +456,11 @@ class NagiV2Loss(nn.Module):
         self.highlight_ramp_end = float(highlight_ramp_end)
         self.detail_weight = float(detail_weight)
         self.detail_global_weight = float(detail_global_weight)
+        self.texture_stats_weight = float(texture_stats_weight)
+        self.texture_stats_sigmas = tuple(float(s) for s in texture_stats_sigmas)
+        self.texture_stats_pool = int(texture_stats_pool)
+        self.texture_stats_asymmetric = bool(texture_stats_asymmetric)
+        self.texture_stats_eps = float(texture_stats_eps)
         self.confidence_l1_weight = float(confidence_l1_weight)
         self.highlight_threshold = float(highlight_threshold)
         self.highlight_transition = float(highlight_transition)
@@ -670,6 +788,18 @@ class NagiV2Loss(nn.Module):
             loss_detail_global = torch.sqrt(diff_detail_global.pow(2) + self.charb.eps2).mean()
             total = total + self.detail_global_weight * loss_detail_global
             out["detail_luma_global"] = loss_detail_global.detach()
+
+        if self.texture_stats_weight > 0:
+            loss_texture_stats = texture_stats_loss(
+                output,
+                target,
+                sigmas=self.texture_stats_sigmas,
+                pool_size=self.texture_stats_pool,
+                asymmetric=self.texture_stats_asymmetric,
+                eps=self.texture_stats_eps,
+            )
+            total = total + self.texture_stats_weight * loss_texture_stats
+            out["texture_stats"] = loss_texture_stats.detach()
 
         if confidence is not None:
             out["confidence_mean"] = confidence.mean().detach()

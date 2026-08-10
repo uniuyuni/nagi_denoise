@@ -1,0 +1,134 @@
+# NagiV2-L Phase 4B: statistical texture-restoration objective.
+#
+# Context (see task notes / commit history):
+#   - Phase 4 (PhotoLab pixel teacher) was abandoned: fine-band registration
+#     correlation plateaued at 0.59, short of the 0.75 gate. Do not revisit.
+#   - Phase 2C (nagi_v2_l_ft3.yaml) proved the confidence gate CAN be opened
+#     (reset_confidence_bias + removing confidence_l1_weight pressure took
+#     confidence mean 0.00025 -> 0.0187, detail_applied 40x) but the result
+#     was a NULL RESULT: output HF did not move. Diagnosis: the detail loss
+#     was pixel-wise (Charbonnier against exact-aligned GT), and the base
+#     head already minimizes that pixel error, so there was no residual left
+#     for the detail head to usefully add -- it learned a detail magnitude
+#     calibrated to the training pairs' HF scale (~3e-4) while real high-ISO
+#     input needs ~1.6e-2, two orders of magnitude apart.
+#
+# Fix tried here: `loss.texture_stats_weight` (nagi_denoise/losses.py
+# texture_stats_loss / NagiV2Loss) rewards matching LOCAL POOLED
+# high-frequency ENERGY statistics between output and target luma, not exact
+# pixel values. Because it is a statistic over a 16x16 window, restoring
+# *plausible* texture energy is enough to close the loss -- it does not
+# require pixel-exact agreement with the target's specific noise realization,
+# which is the trap that produced Phase 2C's null result. Runs on perfectly
+# aligned SIDD/PolyU/synthetic pairs, so it needs no registration.
+#
+# Reuses Phase 2C's proven gate-opening mechanics unchanged (reset_confidence_
+# bias, confidence_l1_weight: 0.0, freeze_trainable_prefixes) and Phase 2B's
+# correlated-noise data mixture unchanged (do not revert either).
+#
+# EARLY KILL CHECK at iter 1000 (see scripts/probe_detail_head.py): measure
+# confidence mean, detail_applied absmean (baseline 1.5e-5), and output HF on
+# the Occi hair crop (256px @ x=2420,y=1040 of
+# ~/ProjectData/test_photos/X-T5 Occi noisy.EXR) at several model.detail_scale
+# values. If HF has not moved materially above detail_scale's default (0.25),
+# this is Phase 2C's null result again -- stop, do not burn the remaining
+# hours.
+#
+# Run (usually via scripts/train_supervisor_ft5.sh, not directly):
+#   pixi run python -m nagi_denoise.train.train_v2 \
+#       --config configs/nagi_v2_l_ft5.yaml --sidd-root SIDD_Medium_Srgb \
+#       --output runs/nagi_v2_l_ft5 --device mps --ckpt-prefix nagi_v2_l_ft5 \
+#       --resume-latest
+
+model:
+  kind: nagi_v2
+  preset: v2-l
+  detail_scale: 0.25
+  compressed_output_clamp: 2.0     # in-graph HDR safety: keep enabled (NaN@step500 lesson)
+  confidence_bias: -0.5            # shell construction only; overwritten by loaded state_dict
+
+data:
+  patch_size: 256
+  # Unchanged from Phase 2B/2C: the correlated-noise mixture is what produced
+  # the current +11.2pt selectivity win. Do not revert it.
+  mixture:
+    sidd: 0.25
+    polyu: 0.35
+    synthetic: 0.40
+  polyu_root: PolyU-Real-World-Noisy-Images-Dataset-master
+  polyu_split: CroppedImages
+  exposure_jitter: [0.25, 4.0]
+  flip_rot: true
+  burst_length: 8
+  num_workers: 2
+  synthetic:
+    a_range: [3.0e-4, 2.0e-2]
+    b_range: [1.0e-6, 1.0e-3]
+    chroma_noise_prob: 0.5
+    chroma_noise_scale: 0.35
+    corr_sigma_range: [0.0, 1.0]
+    chroma_corr_sigma_range: [0.8, 2.0]
+  teacher_root: null
+
+train:
+  batch_size: 2                    # MPS-safe: batch 4+ OOMs/swap-thrashes on this M1 16GB machine
+  grad_accum_steps: 4
+  total_iters: 6000
+  warmup_iters: 200
+  lr: 1.0e-4                       # Phase 2C recipe: only two small heads, near-zero start
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  save_every: 500
+  keep_last_ckpts: 6
+  skip_nonfinite: false            # non-finite loss ABORTS (do not disable)
+  # Fine-tune init from the Phase 2B EMA weights (production checkpoint),
+  # fresh optimizer state.
+  init_checkpoint: runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt
+  init_state: state_dict           # EMA weights
+  init_strict: true
+  # Re-bias the LOADED confidence head open (Phase 2C recipe, proven to work:
+  # confidence mean 0.0001 -> 0.03 at step 0).
+  reset_confidence_bias: -0.5
+  # Train ONLY the detail and confidence heads (~1.2k params). The base
+  # denoiser is finished (Phase 2B); this structurally protects its
+  # cleanliness, SIDD score, chroma behaviour and HDR safety.
+  freeze_trainable_prefixes: ["detail_head.", "confidence_head."]
+
+loss:
+  # Unchanged from Phase 2B/2C.
+  final_weight: 1.0
+  base_weight: 0.35
+  fft_weight: 0.05
+  linear_weight: 0.08
+  highlight_luma_weight: 0.22
+  highlight_chroma_weight: 0.08
+  detail_weight: 0.14              # existing highlight-scoped pixel detail term, kept as-is
+  detail_global_weight: 0.30       # existing unmasked pixel detail term (opens the gate; Phase 2C)
+  confidence_l1_weight: 0.0        # that pressure is what closed the gate in Phase 2A/2B
+  highlight_threshold: 1.0
+  highlight_transition: 0.6
+  detail_kernel_size: 9
+  linear_clamp: 16.0
+  charbonnier_eps: 1.0e-3
+  # NEW (Phase 4B): statistical texture-restoration term. Penalizes the gap
+  # between output and target LOCAL POOLED high-frequency energy (16x16
+  # windows, luma-only, two blur scales), not pixel values -- see
+  # nagi_denoise/losses.py texture_stats_loss for the full derivation.
+  # asymmetric=True (default): only penalizes energy DEFICITS (candidate has
+  # LESS local texture than target); does not fight the pixel-wise terms by
+  # also punishing the rarer case of excess energy, since suppressing excess
+  # is already the base denoiser's job.
+  texture_stats_weight: 0.3
+  texture_stats_sigmas: [1.2, 2.4]
+  texture_stats_pool: 16
+  texture_stats_asymmetric: true
+  texture_stats_eps: 1.0e-3
+  # Distillation off, same reasoning as Phase 2B/2C.
+  distill_weight: 0.0
+
+# No weak_teacher section: PL DeepPrime XD outputs are not pixel-aligned with
+# our EXRs and must not be used as a pixel-level teacher (visual reference
+# only). See nagi_v2_l_ft2.yaml for the full alignment-check writeup.
