@@ -32,7 +32,9 @@ pixi run test          # unit tests
 ```
 
 `coremltools` is optional. Without it everything works except
-`backend="coreml"`.
+`backend="coreml"`. `huggingface_hub` is optional too — it is only needed to
+*download* the weights, and only when they are not already present locally
+(see [Where the weights come from](#where-the-weights-come-from)).
 
 ## Quick start
 
@@ -48,6 +50,48 @@ out = denoise(img, backend="coreml")  # ~3.6x faster model stage on Apple Silico
 That is the whole API for normal use. `denoise()` loads the production
 checkpoint by default and caches it, so repeated calls in one process pay the
 load cost once.
+
+## Where the weights come from
+
+The checkpoint and the exported Core ML packages are resolved **locally
+first**. A download from the Hugging Face Hub
+([`uniuyuni/nagi_denoise`](https://huggingface.co/uniuyuni/nagi_denoise)) is
+the *last* resort, never the first. One shared chain
+(`nagi_denoise/assets.py`) serves both backends, stopping at the first hit:
+
+| # | source | needs the network? |
+|---|---|---|
+| 1 | an explicit path (`weights=` / `coreml_package=`) — always wins, never falls back | no |
+| 2 | `$NAGI_DENOISE_WEIGHTS` / `$NAGI_DENOISE_COREML_PACKAGE` | no |
+| 3 | the in-repo copy under `runs/` — the developer / trainer case | no |
+| 4 | an already-populated Hugging Face cache (`local_files_only=True`) | no |
+| 5 | download from the Hub, logged at INFO with repo id, filename and destination | **yes** |
+
+So if you trained the checkpoint yourself, cloned the repo with its artifacts,
+set the env var, or downloaded it once already, nothing is ever fetched.
+
+To pre-fetch deliberately, or to point other tooling at the resolved file:
+
+```python
+from nagi_denoise.assets import resolve_weights, resolve_coreml_package
+
+resolve_weights()                              # -> Path to the .pt
+resolve_coreml_package()                       # -> Path to the fp16 .mlpackage
+resolve_weights(allow_download=False)          # never touches the network
+```
+
+**Forbidding the network.** Pass `allow_download=False` to `denoise()` or to
+either resolver, or set `NAGI_DENOISE_OFFLINE=1` (also `true`/`yes`/`on`) to
+enforce it process-wide; the production CLI has `--offline`. Offline mode
+still uses a populated cache — reading a local cache is not a fetch — but it
+refuses step 5 and raises `nagi_denoise.assets.AssetNotFoundError` naming
+every place it looked and how to supply the file.
+
+`huggingface_hub` is an **optional** dependency (`pip install
+'nagi-denoise[hub]'`). It is imported lazily and only if steps 4/5 are
+actually reached, so `import nagi_denoise` and steps 1–3 work without it.
+Downloads land in the standard HF cache (`$HF_HOME`), never inside this
+repository.
 
 ## CLI
 
@@ -163,6 +207,7 @@ scenes, not aspirations:
 nagi_denoise/                 # the package
 ├── __init__.py               # public API: denoise(), Denoiser, NagiV2, helpers
 ├── pipeline/denoise.py       # THE entry point: denoise() + the production CLI
+├── assets.py                 # weight resolution: local first, Hugging Face Hub last
 ├── coreml.py                 # optional Core ML backend (lazy coremltools import)
 ├── infer.py                  # Denoiser: checkpoint load + Hann-window tiled inference
 ├── cli.py                    # legacy model-only CLI (`nagi-denoise`)
@@ -219,7 +264,9 @@ The weights are non-commercial because they are a derived work of the PolyU
 Real-World Noisy Images Dataset, which restricts use to non-commercial
 purposes, and PolyU supplied 35% of the training mixture. `MODEL_LICENSE`
 explains why that dataset could not simply be dropped, and how to retrain
-without it if you need commercially usable weights.
+without it if you need commercially usable weights. `MODEL_CARD.md` is the
+same story in Hugging Face form — it is what gets published as the Hub repo's
+`README.md` (see `scripts/upload_to_hf.py`, which is dry-run by default).
 
 Third-party code vendored under `nagi_denoise/bench/third_party/` (NAFNet, MIT;
 SCUNet, Apache-2.0) is attributed in `NOTICE`, with the original licence texts

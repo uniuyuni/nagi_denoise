@@ -37,7 +37,7 @@ export-coreml = "python scripts/export_coreml_nagi_v2.py"
 # --- environment / tests ------------------------------------------------
 check-env = "python scripts/check_env.py"
 check-mps = "python scripts/check_env.py --require-mps"
-test = "python tests/test_model.py && python tests/test_denoise_pipeline.py && python tests/test_losses.py"
+test = "python tests/test_model.py && python tests/test_denoise_pipeline.py && python tests/test_losses.py && python tests/test_assets.py"
 
 # --- quality gates and benchmarks ---------------------------------------
 # The four production quality gates (selectivity / HDR highlight / seams).

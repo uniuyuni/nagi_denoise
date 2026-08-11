@@ -26,6 +26,7 @@ from typing import Union
 import numpy as np
 import torch
 
+from ..assets import resolve_coreml_package, resolve_weights
 from ..devices import resolve_device
 from ..infer import Denoiser
 from .detail_guard import write_exr, write_tiff
@@ -34,6 +35,10 @@ from .probe import read_image
 
 # The production checkpoint (NagiV2-L, "Phase 2B"). Verified: SIDD Val
 # 39.030 dB, HDR highlight retention 0.9979 on the X-T5 Room crop.
+#
+# This is only the *in-repo* location (step 3 of the resolution chain). When
+# it is absent, `nagi_denoise.assets.resolve_weights` falls through to the
+# Hugging Face cache and, last of all, a Hub download -- see that module.
 PRODUCTION_WEIGHTS = (
     Path(__file__).resolve().parents[2] / "runs" / "nagi_v2_l_ft2" / "nagi_v2_l_ft2_final.pt"
 )
@@ -79,8 +84,12 @@ HIGHLIGHT_GUARD_DEFAULT_TRANSITION = 0.15
 HIGHLIGHT_GUARD_DEFAULT_STRENGTH = 0.85
 
 
-def _resolve_weights(weights: Union[str, Path, None]) -> str:
-    return str(PRODUCTION_WEIGHTS) if weights is None else str(Path(weights))
+def _resolve_weights(weights: Union[str, Path, None], allow_download: bool = True) -> str:
+    """Locate the checkpoint. Thin wrapper over
+    :func:`nagi_denoise.assets.resolve_weights` -- explicit path, then
+    ``$NAGI_DENOISE_WEIGHTS``, then the in-repo ``runs/`` copy, then the
+    Hugging Face cache, and only then a download."""
+    return str(resolve_weights(weights, allow_download=allow_download))
 
 
 def _linear_luma_np(x: np.ndarray) -> np.ndarray:
@@ -161,15 +170,22 @@ def _get_denoiser(weights: str, device: str) -> Denoiser:
         return dn
 
 
-def _get_coreml_denoiser(package: Union[str, Path, None], compute_units: str, tile: int):
+def _get_coreml_denoiser(
+    package: Union[str, Path, None],
+    compute_units: str,
+    tile: int,
+    allow_download: bool = True,
+):
     """Return a cached ``CoreMLTiledDenoiser``, constructing it if needed.
 
     Imported lazily so that ``coremltools`` is never required to import or use
-    the default (PyTorch) path.
+    the default (PyTorch) path. The package is resolved once, here, so the
+    cache is keyed on the *resolved* path and a cache hit can never re-enter
+    the resolver (and therefore can never touch the network twice).
     """
-    from ..coreml import CoreMLTiledDenoiser, default_mlpackage
+    from ..coreml import CoreMLTiledDenoiser
 
-    path = str(Path(package)) if package is not None else str(default_mlpackage())
+    path = str(resolve_coreml_package(package, allow_download=allow_download))
     key = (path, str(compute_units), int(tile))
     with _CACHE_LOCK:
         dn = _COREML_CACHE.get(key)
@@ -204,16 +220,22 @@ def denoise(
     highlight_guard_strength: float = HIGHLIGHT_GUARD_DEFAULT_STRENGTH,
     batch_size: int = 1,
     amp_dtype: "torch.dtype | None" = None,
+    allow_download: bool = True,
 ) -> np.ndarray:
     """Denoise a float32 HWC linear-light RGB image with the production NagiV2 pipeline.
 
     Args:
         img: (H, W, 3) float32 numpy array, linear-light RGB. HDR-safe: values
             above 1.0 are preserved, never clipped.
-        weights: checkpoint path. ``None`` uses the production checkpoint
-            (``runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt``). Used by the
-            "torch" backend only -- the "coreml" backend runs whatever
-            checkpoint was baked into ``coreml_package``.
+        weights: checkpoint path. An explicit path always wins and is never
+            second-guessed. ``None`` resolves the production checkpoint
+            through :func:`nagi_denoise.assets.resolve_weights`:
+            ``$NAGI_DENOISE_WEIGHTS``, then the in-repo copy at
+            ``runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt``, then an existing
+            Hugging Face cache entry, and only if all of those miss, a
+            download from ``uniuyuni/nagi_denoise``. Used by the "torch"
+            backend only -- the "coreml" backend runs whatever checkpoint was
+            baked into ``coreml_package``.
         device: "auto" (default), "mps", "cuda", or "cpu". "torch" backend only.
         backend: which engine runs the model stage.
               * ``"torch"`` (default): PyTorch. The reference implementation;
@@ -227,8 +249,11 @@ def denoise(
             The two backends stitch tiles with the same code path, so their
             geometry is identical; only the per-tile forward differs.
         coreml_package: path to the ``.mlpackage`` for ``backend="coreml"``.
-            ``None`` uses ``nagi_denoise.coreml.default_mlpackage()``
-            (overridable with ``$NAGI_DENOISE_COREML_PACKAGE``).
+            ``None`` resolves it through
+            :func:`nagi_denoise.assets.resolve_coreml_package`, in the same
+            order as ``weights`` above (``$NAGI_DENOISE_COREML_PACKAGE``,
+            then ``runs/phase5_speed/coreml/``, then the HF cache, then a
+            download).
         coreml_compute_units: "cpu_and_gpu" (default), "cpu_only", or "all".
             **Never use "all" with an fp16 package**: it lets Core ML
             dispatch to the Apple Neural Engine, which corrupts this graph --
@@ -297,6 +322,14 @@ def denoise(
             path. On this M1 it bought nothing (247s vs 237s); use
             ``backend="coreml"`` for the real speedup.
             ``backend="torch"`` only.
+        allow_download: if ``False``, asset resolution may never fetch from
+            the Hugging Face Hub -- it stops after the offline cache lookup
+            and raises ``nagi_denoise.assets.AssetNotFoundError`` if the
+            asset is genuinely missing. Setting ``$NAGI_DENOISE_OFFLINE=1``
+            has the same effect globally. Assets that are already present
+            locally (explicit path, env var, in-repo ``runs/``, populated HF
+            cache) are unaffected -- those routes never touch the network
+            either way.
 
     Returns:
         (H, W, 3) float32 numpy array, same color space (linear) as input.
@@ -326,7 +359,7 @@ def denoise(
     )
 
     if backend == "torch":
-        weights_str = _resolve_weights(weights)
+        weights_str = _resolve_weights(weights, allow_download=allow_download)
         dn = _get_denoiser(weights_str, device)
 
         if detail_strength is not None:
@@ -363,7 +396,9 @@ def denoise(
 
         from ..coreml import apply_highlight_guard_np
 
-        cml = _get_coreml_denoiser(coreml_package, coreml_compute_units, int(tile))
+        cml = _get_coreml_denoiser(
+            coreml_package, coreml_compute_units, int(tile), allow_download=allow_download
+        )
         out = cml.denoise_array(x, overlap=int(overlap))
         # The exported graph has the in-graph guard disarmed; apply the exact
         # post-hoc equivalent here (see nagi_denoise/coreml.py for why the two
@@ -408,7 +443,16 @@ def main() -> None:
     )
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--weights", default=None, help="Defaults to the production checkpoint.")
+    ap.add_argument(
+        "--weights", default=None,
+        help="Defaults to the production checkpoint, resolved via $NAGI_DENOISE_WEIGHTS, "
+             "then runs/, then the Hugging Face cache, then a Hub download.",
+    )
+    ap.add_argument(
+        "--offline", action="store_true",
+        help="Never download assets from the Hugging Face Hub; fail instead if an "
+             "asset is missing locally. Same as $NAGI_DENOISE_OFFLINE=1.",
+    )
     ap.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
     ap.add_argument(
         "--backend", default="torch", choices=["torch", "coreml"],
@@ -467,6 +511,7 @@ def main() -> None:
         highlight_guard=highlight_guard,
         highlight_guard_transition=args.highlight_guard_transition,
         highlight_guard_strength=args.highlight_guard_strength,
+        allow_download=not args.offline,
     )
     print(f"highlight_guard resolved: {denoise.last_highlight_guard}")
 

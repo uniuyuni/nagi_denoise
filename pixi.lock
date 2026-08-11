@@ -563,7 +563,7 @@ packages:
 - pypi: ./
   name: nagi-denoise
   version: 1.0.0
-  sha256: 158d08f7b297ef21fa1ddefb3573b2a2d09b54082e8685f0fb2d3047187f787e
+  sha256: 632d17b87358430ff0338cde59c041acec721b45bb805b8cdd6442cf27a3f143
   requires_dist:
   - torch>=2.1
   - numpy>=1.24
@@ -574,6 +574,7 @@ packages:
   - tifffile>=2024.1
   - opencv-python>=4.8 ; extra == 'hdr-io'
   - coremltools>=9,<10 ; extra == 'coreml'
+  - huggingface-hub>=0.23 ; extra == 'hub'
   requires_python: '>=3.10'
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/ncurses-6.6-h1d4f5a5_0.conda
   sha256: 4ea6c620b87bd1d42bb2ccc2c87cd2483fa2d7f9e905b14c223f11ff3f4c455d

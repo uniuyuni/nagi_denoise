@@ -99,7 +99,15 @@ def is_available() -> bool:
 
 
 def default_mlpackage() -> Path:
-    """Resolve the default ``.mlpackage`` path (env var wins)."""
+    """The default ``.mlpackage`` path, *without* consulting the Hub.
+
+    Env var wins, otherwise the in-repo export. This is the purely local
+    answer and it never touches the network or needs ``huggingface_hub``; the
+    returned path is not guaranteed to exist. For the full resolution chain
+    (which additionally falls back to the Hugging Face cache and then to a
+    download) use :func:`nagi_denoise.assets.resolve_coreml_package`, which is
+    what :class:`CoreMLTiledDenoiser` calls.
+    """
     override = os.environ.get(MLPACKAGE_ENV_VAR)
     return Path(override) if override else DEFAULT_MLPACKAGE
 
@@ -161,8 +169,14 @@ class CoreMLTiledDenoiser:
     """Tiled Core ML inference matching ``Denoiser._tiled_forward``'s geometry.
 
     Args:
-        mlpackage_path: exported ``.mlpackage``. ``None`` uses
-            :func:`default_mlpackage`.
+        mlpackage_path: exported ``.mlpackage``. An explicit path always
+            wins. ``None`` resolves it through
+            :func:`nagi_denoise.assets.resolve_coreml_package`:
+            ``$NAGI_DENOISE_COREML_PACKAGE``, then the in-repo export under
+            ``runs/phase5_speed/coreml/``, then an existing Hugging Face
+            cache entry, and only then a Hub download.
+        allow_download: ``False`` (or ``$NAGI_DENOISE_OFFLINE=1``) forbids
+            that last step, so no network access can occur.
         tile: square tile size. ``None`` reads it from the model's input
             shape (the exported graph is static), which is what you want.
         compute_units: ``"cpu_and_gpu"`` (default), ``"cpu_only"``, or
@@ -185,14 +199,18 @@ class CoreMLTiledDenoiser:
         compute_units: Union[str, Any] = DEFAULT_COMPUTE_UNITS,
         size_multiple: int = 8,
         warmup: bool = True,
+        allow_download: bool = True,
     ) -> None:
         ct = _import_coremltools()
-        path = Path(mlpackage_path) if mlpackage_path is not None else default_mlpackage()
+        from .assets import resolve_coreml_package
+
+        path = resolve_coreml_package(mlpackage_path, allow_download=allow_download)
         if not path.exists():
             raise FileNotFoundError(
                 f"Core ML package not found: {path}. Export one with "
-                "`pixi run export-coreml`, or pass coreml_package=... / set "
-                f"${MLPACKAGE_ENV_VAR}."
+                "`pixi run export-coreml`, download it from "
+                "https://huggingface.co/uniuyuni/nagi_denoise, or pass "
+                f"coreml_package=... / set ${MLPACKAGE_ENV_VAR}."
             )
 
         self.path = path

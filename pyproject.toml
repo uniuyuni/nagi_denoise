@@ -36,6 +36,10 @@ hdr-io = ["opencv-python>=4.8"]
 # Core ML fast path (Apple Silicon). Imported lazily -- nagi_denoise works
 # without it, you just cannot use backend="coreml".
 coreml = ["coremltools>=9,<10"]
+# Fetching the weights from the Hugging Face Hub. Imported lazily and only
+# when the asset is missing locally -- see nagi_denoise/assets.py. Everything
+# except that last-resort download works without it.
+hub = ["huggingface_hub>=0.23"]
 
 [project.scripts]
 # The production CLI (two-stage pipeline, HDR-safe, EXR/TIFF).
