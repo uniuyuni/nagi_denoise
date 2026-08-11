@@ -17,6 +17,7 @@ pyyaml = ">=6.0"
 scipy = ">=1.10"
 einops = ">=0.7"
 timm = ">=0.9"
+coremltools = ">=9,<10"
 "nagi-denoise" = { path = ".", editable = true }
 openexr = ">=3.4.12, <4"
 tifffile = ">=2026.3.3, <2027"

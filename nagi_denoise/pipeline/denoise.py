@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
+import torch
 
 from ..devices import resolve_device
 from ..infer import Denoiser
@@ -169,6 +170,8 @@ def denoise(
     highlight_guard: Union[bool, float] = True,
     highlight_guard_transition: float = HIGHLIGHT_GUARD_DEFAULT_TRANSITION,
     highlight_guard_strength: float = HIGHLIGHT_GUARD_DEFAULT_STRENGTH,
+    batch_size: int = 1,
+    amp_dtype: "torch.dtype | None" = None,
 ) -> np.ndarray:
     """Denoise a float32 HWC linear-light RGB image with the production NagiV2 pipeline.
 
@@ -224,6 +227,12 @@ def denoise(
             for the guard blend. Ignored when ``highlight_guard=False``.
         highlight_guard_strength: maximum blend-toward-input strength (0-1)
             above the threshold. Ignored when ``highlight_guard=False``.
+        batch_size: number of tiles forwarded together per model call during
+            tiled inference (Phase 5 speed lever). Default 1 matches the
+            behavior of every existing caller.
+        amp_dtype: optional ``torch.autocast`` dtype for the model forward
+            (Phase 5 speed lever), e.g. ``torch.float16``. ``None`` (default)
+            keeps the exact fp32 path.
 
     Returns:
         (H, W, 3) float32 numpy array, same color space (linear) as input.
@@ -261,10 +270,13 @@ def denoise(
     dn.model.highlight_protect_transition = float(guard_info["transition"])
     dn.model.highlight_protect_strength = float(guard_info["strength"])
 
-    out = dn.denoise_array(x, input_space="linear", tile=int(tile), overlap=int(overlap))
+    out = dn.denoise_array(
+        x, input_space="linear", tile=int(tile), overlap=int(overlap),
+        batch_size=int(batch_size), amp_dtype=amp_dtype,
+    )
 
     if chroma_cleanup:
-        out, _stats, _gate = smooth_chroma(out, **CH)
+        out, _stats, _gate = smooth_chroma(out, compute_stats=False, **CH)
 
     blend = float(input_blend)
     if not 0.0 <= blend <= 1.0:
