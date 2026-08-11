@@ -7,6 +7,10 @@ in the Phase 4B task notes. Heavy (full-resolution tiled inference over
 several hundred-MB EXRs); run it after training has stopped so it doesn't
 contend with the trainer for MPS/CPU/memory.
 
+NOTE (v1.0 cleanup): the ft5 run was a negative result and its checkpoints
+under `runs/nagi_v2_l_ft5/` were moved to the Trash. Re-train from
+`configs/nagi_v2_l_ft5.yaml` if you need to re-run this.
+
 Usage:
     pixi run python scripts/eval_phase4b.py \\
         --ft5-weights runs/nagi_v2_l_ft5/nagi_v2_l_ft5_final.pt \\

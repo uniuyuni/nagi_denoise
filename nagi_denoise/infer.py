@@ -90,10 +90,15 @@ def _detect_arch(model_cfg: dict) -> str:
 
 
 class Denoiser:
-    """High-level inference wrapper around a trained NagiNR or NagiV2 model.
+    """High-level inference wrapper around a trained NagiV2 (or legacy NagiNR) model.
+
+    This is the *model stage only*: tiled forward with Hann-window blending. It
+    does not run the chroma cleanup pass, the highlight guard, or
+    ``input_blend``. For production output call
+    ``nagi_denoise.denoise()`` instead.
 
     Example:
-        dn = Denoiser.load("runs/nagi_nr_s/nagi_nr_s_final.pt", device="mps")
+        dn = Denoiser.load("runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt", device="mps")
         out = dn(img_linear, input_space="linear")   # img_linear: (3,H,W) float32
     """
 

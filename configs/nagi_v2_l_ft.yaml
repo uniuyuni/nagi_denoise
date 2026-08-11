@@ -1,5 +1,11 @@
 # NagiV2-L Phase 2 weak-teacher fine-tune.
 #
+# ABANDONED ROUTE -- kept for the record. The production model is
+# `nagi_v2_l_ft2.yaml`, not this one. The `weak_teacher.pairs` teacher EXRs
+# below live under `runs/nagi_v2_l_weak/`, which was moved to the Trash in the
+# v1.0 cleanup; regenerate them with
+# `python -m nagi_denoise.pipeline.build_pseudo_teacher` before re-running.
+#
 # Purpose:
 #   Starting from the Phase 1 from-scratch checkpoint
 #   (runs/nagi_v2_l/nagi_v2_l_final.pt, SIDD Val 39.068 dB), close the

@@ -3,7 +3,7 @@ authors = ["Nagi NR"]
 channels = ["conda-forge"]
 name = "nagi-denoise"
 platforms = ["osx-arm64"]
-version = "0.2.0"
+version = "1.0.0"
 
 [dependencies]
 python = "3.11.*"
@@ -26,18 +26,41 @@ tifffile = ">=2026.3.3, <2027"
 PYTORCH_ENABLE_MPS_FALLBACK = "1"
 
 [tasks]
+
+# --- production ---------------------------------------------------------
+# Denoise an EXR/TIFF with the shipped two-stage pipeline. This is the one
+# you want: `pixi run denoise --input a.exr --output b.exr`.
+denoise = "nagi-denoise-pipeline"
+# Export the production checkpoint to Core ML (the ~3.6x faster backend).
+export-coreml = "python scripts/export_coreml_nagi_v2.py"
+
+# --- environment / tests ------------------------------------------------
 check-env = "python scripts/check_env.py"
 check-mps = "python scripts/check_env.py --require-mps"
 test = "python tests/test_model.py && python tests/test_denoise_pipeline.py && python tests/test_losses.py"
-train-v2-s = "nagi-train-v2 --config configs/nagi_v2_s.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_s --device mps --ckpt-prefix nagi_v2_s --resume-latest"
-eval-sidd-v2 = "nagi-eval-sidd --model nagi_v2 --weights runs/nagi_v2_s/nagi_v2_s_final.pt --device auto"
+
+# --- quality gates and benchmarks ---------------------------------------
+# The four production quality gates (selectivity / HDR highlight / seams).
+gates = "python scripts/phase5_gates.py"
+gates-coreml = "python scripts/gates_coreml_nagi_v2.py"
+# Core ML numerical validation vs the PyTorch reference on real ROI tiles.
+validate-coreml = "python scripts/validate_coreml_nagi_v2.py"
+bench-coreml = "python scripts/bench_coreml_nagi_v2.py"
+eval-sidd-v2 = "nagi-eval-sidd --model nagi_v2 --weights runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt --device auto"
 eval-sidd-nafnet = "nagi-eval-sidd --model nafnet --weights benchmarks/nafnet/NAFNet-SIDD-width64.pth --device auto"
 eval-sidd-scunet = "nagi-eval-sidd --model scunet --weights benchmarks/scunet/scunet_color_real_psnr.pth --device auto"
-denoise = "nagi-denoise"
-denoise-exr = "python -m nagi_denoise.pipeline.denoise_exr"
-denoise-v2 = "python -m nagi_denoise.pipeline.denoise"
+
+# --- training -----------------------------------------------------------
+train-v2-l = "nagi-train-v2 --config configs/nagi_v2_l.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_l --device mps --ckpt-prefix nagi_v2_l --resume-latest"
+train-v2-s = "nagi-train-v2 --config configs/nagi_v2_s.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_s --device mps --ckpt-prefix nagi_v2_s --resume-latest"
+precompute-teacher = "python -m nagi_denoise.pipeline.precompute_teacher --sidd-root SIDD_Medium_Srgb --weights benchmarks/nafnet/NAFNet-SIDD-width64.pth --device mps"
+
+# --- diagnostics / research (not the production path) -------------------
+# Model-only single-image CLI: no chroma pass, no highlight guard.
+denoise-model = "nagi-denoise"
+# Legacy research driver carrying the retired multi-filter preset stack.
+# Kept to reproduce old comparisons only -- it is NOT the shipped pipeline.
+denoise-exr-legacy = "python -m nagi_denoise.pipeline.denoise_exr"
 roi-eval = "python -m nagi_denoise.pipeline.roi_noise_eval"
 accept-eval = "python -m nagi_denoise.pipeline.acceptance"
-train-v2-l = "nagi-train-v2 --config configs/nagi_v2_l.yaml --sidd-root SIDD_Medium_Srgb --output runs/nagi_v2_l --device mps --ckpt-prefix nagi_v2_l --resume-latest"
 crop-compare = "python -m nagi_denoise.pipeline.make_crop_compare"
-precompute-teacher = "python -m nagi_denoise.pipeline.precompute_teacher --sidd-root SIDD_Medium_Srgb --weights benchmarks/nafnet/NAFNet-SIDD-width64.pth --device mps"

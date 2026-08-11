@@ -1,6 +1,14 @@
-"""CLI to denoise a single image with a trained Nagi NR checkpoint.
+"""Model-only single-image CLI. Entry point: ``nagi-denoise``.
 
-Entry point: ``nagi-denoise``.
+This runs *just* the tiled model forward (``Denoiser``) on one file. It is NOT
+the production pipeline: it does not run the chroma cleanup pass, does not arm
+the HDR highlight guard, and does not apply ``input_blend``. It also clamps to
+[0, 1] when writing 8-bit formats.
+
+For production output use ``nagi-denoise-pipeline`` (or
+``nagi_denoise.denoise()`` from Python). This command is kept for quick
+model-only checks and for the sRGB PNG/JPEG path, which the production CLI
+does not cover.
 """
 from __future__ import annotations
 import argparse
@@ -58,7 +66,11 @@ def save_image(t: torch.Tensor, path: Path, input_space: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="nagi-denoise", description="Denoise an image with Nagi NR.")
+    ap = argparse.ArgumentParser(
+        prog="nagi-denoise",
+        description="Model-only single-image denoise (no chroma pass, no highlight "
+                    "guard). For production output use nagi-denoise-pipeline.",
+    )
     ap.add_argument("--weights", required=True)
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)

@@ -6,6 +6,10 @@ fine-tune (nagi_v2_l_ft5): at iter 1000, if the output HF has not moved
 materially above the noisy-crop baseline as detail_scale increases, that is
 Phase 2C's null result again -- stop the run.
 
+NOTE (v1.0 cleanup): the ft5 checkpoints under `runs/nagi_v2_l_ft5/` were
+moved to the Trash (negative result). Point `--weights` at any NagiV2
+checkpoint; the production one is `runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt`.
+
 Usage:
     pixi run python scripts/probe_detail_head.py \\
         --weights runs/nagi_v2_l_ft5/nagi_v2_l_ft5_0001000.pt \\

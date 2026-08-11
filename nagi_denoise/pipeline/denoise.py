@@ -1,16 +1,19 @@
-"""Single production entry point for the NagiV2 denoise pipeline (Phase 3).
+"""Single production entry point for the NagiV2 denoise pipeline.
+
+``denoise()`` is the function external callers should use; everything else in
+this package is machinery underneath it.
 
 The whole pipeline is deliberately two stages:
 
 1. ``Denoiser.load(weights).denoise_array(img, input_space="linear", ...)`` --
-   NagiV2-L tiled inference (Hann-window tiling, seam-free).
+   NagiV2-L tiled inference (Hann-window tiling, seam-free). Optionally run
+   through Core ML instead (``backend="coreml"``, ~3.6x faster).
 2. A single deterministic chroma cleanup pass:
    ``flat_chroma_smoother.smooth_chroma(out, **CH)``.
 
 Both stages operate on float32 linear-light HWC RGB numpy arrays and preserve
-HDR values above 1.0. Nothing else is added on top of this -- see the module
-docstring in ``flat_chroma_smoother.py`` for why the legacy ~40-filter stack
-was retired.
+HDR values above 1.0. Nothing else is added on top of this -- see
+``docs/architecture.md`` for why the legacy ~40-filter stack was retired.
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ CH: dict = dict(
 )
 
 _MODEL_CACHE: dict[tuple[str, str], Denoiser] = {}
+_COREML_CACHE: dict[tuple[str, str, int], object] = {}
 _CACHE_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
 
@@ -157,11 +161,39 @@ def _get_denoiser(weights: str, device: str) -> Denoiser:
         return dn
 
 
+def _get_coreml_denoiser(package: Union[str, Path, None], compute_units: str, tile: int):
+    """Return a cached ``CoreMLTiledDenoiser``, constructing it if needed.
+
+    Imported lazily so that ``coremltools`` is never required to import or use
+    the default (PyTorch) path.
+    """
+    from ..coreml import CoreMLTiledDenoiser, default_mlpackage
+
+    path = str(Path(package)) if package is not None else str(default_mlpackage())
+    key = (path, str(compute_units), int(tile))
+    with _CACHE_LOCK:
+        dn = _COREML_CACHE.get(key)
+        if dn is None:
+            dn = CoreMLTiledDenoiser(path, tile=None, compute_units=compute_units)
+            if int(dn.tile) != int(tile):
+                raise ValueError(
+                    f"the Core ML package {Path(path).name} is a fixed {dn.tile}x{dn.tile} "
+                    f"graph but denoise() was called with tile={tile}. Pass tile={dn.tile}, "
+                    "or re-export at the tile size you want "
+                    "(`scripts/export_coreml_nagi_v2.py --tile ...`)."
+                )
+            _COREML_CACHE[key] = dn
+        return dn
+
+
 def denoise(
     img: np.ndarray,
     *,
     weights: Union[str, Path, None] = None,
     device: str = "auto",
+    backend: str = "torch",
+    coreml_package: Union[str, Path, None] = None,
+    coreml_compute_units: str = "cpu_and_gpu",
     tile: int = 768,
     overlap: int = 64,
     chroma_cleanup: bool = True,
@@ -179,10 +211,32 @@ def denoise(
         img: (H, W, 3) float32 numpy array, linear-light RGB. HDR-safe: values
             above 1.0 are preserved, never clipped.
         weights: checkpoint path. ``None`` uses the production checkpoint
-            (``runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt``).
-        device: "auto" (default), "mps", "cuda", or "cpu".
+            (``runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt``). Used by the
+            "torch" backend only -- the "coreml" backend runs whatever
+            checkpoint was baked into ``coreml_package``.
+        device: "auto" (default), "mps", "cuda", or "cpu". "torch" backend only.
+        backend: which engine runs the model stage.
+              * ``"torch"`` (default): PyTorch. The reference implementation;
+                every quality number in the docs was measured on this path.
+              * ``"coreml"``: the exported Core ML graph
+                (``nagi_denoise.coreml``). ~3.6x faster on the model stage
+                (39.8MP: 65s vs 237s) at the cost of fp16 rounding -- max
+                per-pixel difference ~0.018 vs the fp32 torch path on the
+                validation tiles. Needs the optional ``coremltools``
+                dependency and an exported ``.mlpackage``.
+            The two backends stitch tiles with the same code path, so their
+            geometry is identical; only the per-tile forward differs.
+        coreml_package: path to the ``.mlpackage`` for ``backend="coreml"``.
+            ``None`` uses ``nagi_denoise.coreml.default_mlpackage()``
+            (overridable with ``$NAGI_DENOISE_COREML_PACKAGE``).
+        coreml_compute_units: "cpu_and_gpu" (default), "cpu_only", or "all".
+            **Never use "all" with an fp16 package**: it lets Core ML
+            dispatch to the Apple Neural Engine, which corrupts this graph --
+            peak values run 1.25x-4.8x high on every validation tile. The
+            default is the only setting validated for production output.
         tile: square tile size for tiled inference. See ``Denoiser`` for the
-            Hann-window seam-free tiling scheme.
+            Hann-window seam-free tiling scheme. With ``backend="coreml"``
+            this must match the exported graph's fixed tile size (768).
         overlap: overlap in pixels between adjacent tiles.
         chroma_cleanup: if True (default), run the deterministic
             ``smooth_chroma`` stage with the ``CH`` parameters after model
@@ -209,17 +263,23 @@ def denoise(
             ships with this guard *disabled*, which lets the model darken
             the brightest highlights on low-dynamic-range scenes (verified
             defect: up to -38% on the top 1% of luma). Values:
-              * ``True`` (default): adaptive. Threshold is derived once from
-                the *whole* input image's top-0.1% linear luma:
-                ``threshold = min(1.0, 0.7 * p99.9(input_luma))``. This
-                works across scenes with very different peak brightness
-                (a fixed threshold of 1.0 never engages on scenes whose
-                highlights sit at 0.5-0.7).
-              * a float: pins an explicit threshold, bypassing the adaptive
-                rule.
+              * ``True`` (default): *conditional*. The guard is armed at a
+                fixed luma threshold of 1.0 only when the input actually
+                contains above-SDR content, i.e. when the whole image's
+                top-0.1% linear luma exceeds
+                ``HIGHLIGHT_GUARD_MIN_P999`` (1.0); otherwise it stays
+                disarmed. On the 8 diagnostic scenes this lifts highlight
+                retention to ~1.000 on true-HDR scenes at *identical*
+                flat-region noise, and never engages on low-range scenes.
+                (An earlier adaptive variant that scaled the threshold to
+                each image's own peak was rejected -- see the module-level
+                note: it blended noisy input back in over large areas and
+                measured 3.7x more flat-region noise on Z7 bird.)
+              * a float: pins an explicit threshold, bypassing the
+                conditional rule.
               * ``False``: disables the guard entirely (matches the
                 as-shipped checkpoint behavior).
-            The resolved threshold is computed once over the full image
+            The decision and threshold are computed once over the full image
             (never per tile) so every tile in a tiled inference pass shares
             the same threshold -- computing it per tile would reintroduce
             seams at tile boundaries.
@@ -228,11 +288,15 @@ def denoise(
         highlight_guard_strength: maximum blend-toward-input strength (0-1)
             above the threshold. Ignored when ``highlight_guard=False``.
         batch_size: number of tiles forwarded together per model call during
-            tiled inference (Phase 5 speed lever). Default 1 matches the
-            behavior of every existing caller.
-        amp_dtype: optional ``torch.autocast`` dtype for the model forward
-            (Phase 5 speed lever), e.g. ``torch.float16``. ``None`` (default)
-            keeps the exact fp32 path.
+            tiled inference. Default 1. Measured on this M1, larger batches
+            are *slower*, not faster (b2: 273s, b4: 1014s vs b1: 237s) --
+            leave it at 1 unless you are benchmarking other hardware.
+            ``backend="torch"`` only.
+        amp_dtype: optional ``torch.autocast`` dtype for the model forward,
+            e.g. ``torch.float16``. ``None`` (default) keeps the exact fp32
+            path. On this M1 it bought nothing (247s vs 237s); use
+            ``backend="coreml"`` for the real speedup.
+            ``backend="torch"`` only.
 
     Returns:
         (H, W, 3) float32 numpy array, same color space (linear) as input.
@@ -248,32 +312,69 @@ def denoise(
             f"denoise() expects a (H, W, 3) float32 HWC linear RGB array, got shape {img.shape}"
         )
 
+    backend = str(backend).lower()
+    if backend not in ("torch", "coreml"):
+        raise ValueError(f"backend must be 'torch' or 'coreml', got {backend!r}")
+
     x = np.nan_to_num(
         img.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0, copy=True
     )
 
-    weights_str = _resolve_weights(weights)
-    dn = _get_denoiser(weights_str, device)
-
-    if detail_strength is not None:
-        dn.model.detail_scale = float(detail_strength)
-
-    # Resolve and (re-)apply the highlight guard on every call. The Denoiser
-    # instance is cached across calls, so leftover state from a previous
-    # call (e.g. a different scene's fixed threshold) must never leak in --
-    # all three attributes are always set explicitly below, regardless of
-    # what `highlight_guard` resolves to.
+    # The guard decision is made once, on the whole image, for both backends.
     guard_info = _resolve_highlight_guard(
         x, highlight_guard, highlight_guard_transition, highlight_guard_strength
     )
-    dn.model.highlight_protect_threshold = float(guard_info["threshold"])
-    dn.model.highlight_protect_transition = float(guard_info["transition"])
-    dn.model.highlight_protect_strength = float(guard_info["strength"])
 
-    out = dn.denoise_array(
-        x, input_space="linear", tile=int(tile), overlap=int(overlap),
-        batch_size=int(batch_size), amp_dtype=amp_dtype,
-    )
+    if backend == "torch":
+        weights_str = _resolve_weights(weights)
+        dn = _get_denoiser(weights_str, device)
+
+        if detail_strength is not None:
+            dn.model.detail_scale = float(detail_strength)
+
+        # (Re-)apply the highlight guard on every call. The Denoiser instance
+        # is cached across calls, so leftover state from a previous call (e.g.
+        # a different scene's fixed threshold) must never leak in -- all three
+        # attributes are always set explicitly below, regardless of what
+        # `highlight_guard` resolved to.
+        dn.model.highlight_protect_threshold = float(guard_info["threshold"])
+        dn.model.highlight_protect_transition = float(guard_info["transition"])
+        dn.model.highlight_protect_strength = float(guard_info["strength"])
+
+        out = dn.denoise_array(
+            x, input_space="linear", tile=int(tile), overlap=int(overlap),
+            batch_size=int(batch_size), amp_dtype=amp_dtype,
+        )
+    else:
+        # Core ML: the exported graph is fixed, so the torch-only knobs cannot
+        # be honoured. Fail loudly rather than silently ignoring them.
+        for name, value, default in (
+            ("weights", weights, None),
+            ("detail_strength", detail_strength, None),
+            ("amp_dtype", amp_dtype, None),
+            ("batch_size", int(batch_size), 1),
+        ):
+            if value != default:
+                raise ValueError(
+                    f"{name}={value!r} is not supported with backend='coreml' "
+                    "(the exported graph is static); use backend='torch', or "
+                    "re-export the graph you want."
+                )
+
+        from ..coreml import apply_highlight_guard_np
+
+        cml = _get_coreml_denoiser(coreml_package, coreml_compute_units, int(tile))
+        out = cml.denoise_array(x, overlap=int(overlap))
+        # The exported graph has the in-graph guard disarmed; apply the exact
+        # post-hoc equivalent here (see nagi_denoise/coreml.py for why the two
+        # are identical when the threshold is shared across tiles).
+        out = apply_highlight_guard_np(
+            out, x,
+            threshold=float(guard_info["threshold"]),
+            transition=float(guard_info["transition"]),
+            strength=float(guard_info["strength"]),
+        )
+        guard_info = {**guard_info, "applied": "post-hoc (coreml)"}
 
     if chroma_cleanup:
         out, _stats, _gate = smooth_chroma(out, compute_stats=False, **CH)
@@ -299,15 +400,32 @@ def denoise(
 denoise.last_highlight_guard = None
 
 
-def _cli() -> None:
+def main() -> None:
+    """Production CLI. Entry point: ``nagi-denoise-pipeline``."""
     ap = argparse.ArgumentParser(
-        prog="python -m nagi_denoise.pipeline.denoise",
+        prog="nagi-denoise-pipeline",
         description="Denoise an EXR/TIFF image with the production NagiV2 pipeline.",
     )
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--weights", default=None, help="Defaults to the production checkpoint.")
     ap.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
+    ap.add_argument(
+        "--backend", default="torch", choices=["torch", "coreml"],
+        help="Model engine. 'torch' (default) is the reference path; 'coreml' is "
+             "~3.6x faster on Apple Silicon and needs an exported .mlpackage.",
+    )
+    ap.add_argument(
+        "--coreml-package", default=None,
+        help="Path to the .mlpackage for --backend coreml (default: the exported "
+             "production package; $NAGI_DENOISE_COREML_PACKAGE overrides).",
+    )
+    ap.add_argument(
+        "--coreml-compute-units", default="cpu_and_gpu",
+        choices=["cpu_and_gpu", "cpu_only", "all"],
+        help="Core ML compute units. Do NOT use 'all' with an fp16 package: the "
+             "Neural Engine corrupts this graph (peak values run 1.25-4.8x high).",
+    )
     ap.add_argument("--tile", type=int, default=768)
     ap.add_argument("--overlap", type=int, default=64)
     ap.add_argument("--no-chroma-cleanup", action="store_true")
@@ -338,6 +456,9 @@ def _cli() -> None:
         img,
         weights=args.weights,
         device=args.device,
+        backend=args.backend,
+        coreml_package=args.coreml_package,
+        coreml_compute_units=args.coreml_compute_units,
         tile=args.tile,
         overlap=args.overlap,
         chroma_cleanup=not args.no_chroma_cleanup,
@@ -361,5 +482,10 @@ def _cli() -> None:
     print(f"wrote {out_path}")
 
 
+# Backwards-compatible alias: this CLI used to be reachable only as
+# `python -m nagi_denoise.pipeline.denoise`, whose entry function was `_cli`.
+_cli = main
+
+
 if __name__ == "__main__":
-    _cli()
+    main()

@@ -23,7 +23,7 @@ improve selectivity and is not progress.
 Usage:
     pixi run python -m nagi_denoise.pipeline.eval_selectivity \\
         --noisy "/Users/uniuyuni/ProjectData/test_photos/X-T5 Occi noisy.EXR" \\
-        --weights runs/nagi_v2_l_ft2/nagi_v2_l_ft2_ckpt_0002000.pt \\
+        --weights runs/nagi_v2_l_ft2/nagi_v2_l_ft2_final.pt \\
         --x 2420 --y 1040 --size 256 --device mps \\
         --output-dir runs/phase2b_compare
 """

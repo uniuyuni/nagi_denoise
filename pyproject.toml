@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nagi-denoise"
-version = "0.2.0"
+version = "1.0.0"
 description = "Nagi Denoise: ultra-lightweight HDR-aware blind image denoiser (models + training + inference + benchmark harness)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,12 +30,19 @@ dependencies = [
 
 [project.optional-dependencies]
 hdr-io = ["opencv-python>=4.8"]
+# Core ML fast path (Apple Silicon). Imported lazily -- nagi_denoise works
+# without it, you just cannot use backend="coreml".
+coreml = ["coremltools>=9,<10"]
 
 [project.scripts]
-nagi-train = "nagi_denoise.train.train_nr:main"
-nagi-train-v2 = "nagi_denoise.train.train_v2:main"
+# The production CLI (two-stage pipeline, HDR-safe, EXR/TIFF).
+nagi-denoise-pipeline = "nagi_denoise.pipeline.denoise:main"
+# Model-only single-image CLI (no chroma pass, no highlight guard). Legacy.
 nagi-denoise = "nagi_denoise.cli:main"
 nagi-eval-sidd = "nagi_denoise.bench.eval_sidd_val:main"
+nagi-train-v2 = "nagi_denoise.train.train_v2:main"
+# Trainer for the retired NagiNR architecture; kept so old configs still run.
+nagi-train = "nagi_denoise.train.train_nr:main"
 
 [tool.setuptools.packages.find]
 include = ["nagi_denoise*"]

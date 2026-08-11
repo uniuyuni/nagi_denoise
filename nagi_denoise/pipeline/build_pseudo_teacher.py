@@ -32,7 +32,12 @@ TEST_PHOTOS = Path("/Users/uniuyuni/ProjectData/test_photos")
 RUN_ROOT = ROOT / "runs/baseline_v12"
 BEST = RUN_ROOT
 # Phase 2: NagiV2-L + flat_chroma_smoother outputs, used as the pseudo-teacher
-# base for all weak-teacher scenes (see runs/nagi_v2_l_weak/base/).
+# base for all weak-teacher scenes.
+#
+# NOTE (v1.0 cleanup): `runs/nagi_v2_l_weak/` was 5.6GB of output from the
+# abandoned weak-PL-teacher route and has been moved to the Trash. This script
+# still runs, but it will regenerate that directory from scratch. Nothing on
+# the production path reads it.
 NAGI_V2_WEAK_BASE = ROOT / "runs/nagi_v2_l_weak/base"
 
 
