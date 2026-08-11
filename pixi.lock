@@ -563,7 +563,7 @@ packages:
 - pypi: ./
   name: nagi-denoise
   version: 1.0.0
-  sha256: db33f7c360579ef6ecbf81c1258bf6af6568a6e867957d733e73e54dee51e95c
+  sha256: 158d08f7b297ef21fa1ddefb3573b2a2d09b54082e8685f0fb2d3047187f787e
   requires_dist:
   - torch>=2.1
   - numpy>=1.24

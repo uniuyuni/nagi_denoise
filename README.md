@@ -205,6 +205,24 @@ references) live outside the repo at `~/ProjectData/test_photos`.
 - `docs/README.md` — index of everything in `docs/`, including which files are
   historical.
 
-## License
+## Licence
 
-MIT.
+Code and weights are licensed **separately**, because the training data forces
+it.
+
+| | licence | commercial use |
+|---|---|---|
+| source code (this repository) | **Apache-2.0** — `LICENSE` | yes |
+| trained model weights, incl. exported Core ML graphs | **CC BY-NC 4.0** — `MODEL_LICENSE` | **no** |
+
+The weights are non-commercial because they are a derived work of the PolyU
+Real-World Noisy Images Dataset, which restricts use to non-commercial
+purposes, and PolyU supplied 35% of the training mixture. `MODEL_LICENSE`
+explains why that dataset could not simply be dropped, and how to retrain
+without it if you need commercially usable weights.
+
+Third-party code vendored under `nagi_denoise/bench/third_party/` (NAFNet, MIT;
+SCUNet, Apache-2.0) is attributed in `NOTICE`, with the original licence texts
+in `third_party_licenses/`. Those two networks are used only as benchmark
+comparators and, in NAFNet's case, as a distillation teacher during training —
+neither is part of the inference path.

@@ -1,0 +1,63 @@
+Nagi Denoise
+Copyright 2026 uniuyuni
+
+This product includes software developed by third parties, listed below with
+their original copyright and licence terms. Their licences are reproduced in
+full under `third_party_licenses/`.
+
+================================================================================
+NAFNet
+--------------------------------------------------------------------------------
+Files:      nagi_denoise/bench/third_party/nafnet/
+Source:     https://github.com/megvii-research/NAFNet
+Copyright:  Copyright (c) 2022 megvii-model. All Rights Reserved.
+Licence:    MIT License
+Reference:  Chen, Liangyu and Chu, Xiaojie and Zhang, Xiangyu and Sun, Jian,
+            "Simple Baselines for Image Restoration", arXiv:2204.04676, 2022.
+
+Parts of NAFNet are themselves modified from BasicSR
+(https://github.com/xinntao/BasicSR), Copyright 2018-2020 BasicSR Authors,
+licensed under the Apache License, Version 2.0. The affected files
+(`arch_util.py`, `local_arch.py`) carry that notice in their headers.
+
+Modifications by this project: the sources were vendored unchanged except for
+import paths adjusted to the local package layout.
+
+================================================================================
+SCUNet
+--------------------------------------------------------------------------------
+Files:      nagi_denoise/bench/third_party/scunet/
+Source:     https://github.com/cszn/SCUNet
+Copyright:  Copyright (c) 2022 Kai Zhang
+Licence:    Apache License, Version 2.0
+Reference:  Zhang, Kai and Li, Yawei and Liang, Jingyun and Cao, Jiezhang and
+            Zhang, Yulun and Tang, Hao and Timofte, Radu and Van Gool, Luc,
+            "Practical Blind Image Denoising via Swin-Conv-UNet and Data
+            Synthesis", 2022.
+
+Modifications by this project: import paths adjusted to the local package
+layout; an optional `thop` import was made non-fatal.
+
+================================================================================
+Datasets used for training and evaluation
+--------------------------------------------------------------------------------
+These datasets are NOT redistributed with this repository. They are listed
+because the released model weights are derived from them — see MODEL_LICENSE.
+
+SIDD (Smartphone Image Denoising Dataset)
+    https://abdokamel.github.io/sidd/
+    MIT License.
+    Abdelhamed, Abdelrahman and Lin, Stephen and Brown, Michael S.,
+    "A High-Quality Denoising Dataset for Smartphone Cameras", CVPR 2018.
+
+PolyU Real-World Noisy Images Dataset
+    https://github.com/csjunxu/PolyU-Real-World-Noisy-Images-Dataset
+    Copyright (c) 2018, The Hong Kong Polytechnic University.
+    BSD-style terms with an added NON-COMMERCIAL restriction: "Any
+    redistribution, use, or modification is done solely for non-commercial
+    purposes."
+    Xu, Jun and Li, Hui and Liang, Zhetong and Zhang, David and Zhang, Lei,
+    "Real-world Noisy Image Denoising: A New Benchmark", 2018.
+
+    This restriction is the reason the released model weights are offered under
+    a non-commercial licence while this source code is Apache-2.0.

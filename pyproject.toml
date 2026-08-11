@@ -8,13 +8,16 @@ version = "1.0.0"
 description = "Nagi Denoise: ultra-lightweight HDR-aware blind image denoiser (models + training + inference + benchmark harness)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+# Source code only. The trained weights are CC BY-NC 4.0 -- see MODEL_LICENSE.
+# Kept in the table form `{ text = ... }` rather than PEP 639's bare string:
+# the setuptools in this environment rejects the string form.
+license = { text = "Apache-2.0" }
 authors = [{ name = "Nagi Denoise" }]
 keywords = ["denoising", "hdr", "image-restoration", "pytorch", "mps"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
